@@ -1,0 +1,55 @@
+# Flatpak manifest for Jmail.
+#
+# Regenerate the vendored crate sources after changing dependencies:
+#   cargo generate-lockfile
+#   python3 flatpak-cargo-generator.py Cargo.lock \
+#       -o build-aux/flatpak/cargo-sources.json
+app-id: tech.jptr.jmail
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: jmail
+
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+finish-args:
+  # Network is required for IMAP/SMTP, OAuth and the loopback redirect.
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --talk-name=org.freedesktop.secrets
+  - --filesystem=xdg-download
+  - --metadata=X-DConf=migrate-path=/tech/jptr/jmail/
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/jmail/cargo
+    CARGO_NET_OFFLINE: 'true'
+
+modules:
+  - name: jmail
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --offline --bin jmail
+      - install -Dm755 target/release/jmail /app/bin/jmail
+      - install -Dm644 data/tech.jptr.jmail.desktop
+        /app/share/applications/tech.jptr.jmail.desktop
+      - install -Dm644 data/tech.jptr.jmail.metainfo.xml
+        /app/share/metainfo/tech.jptr.jmail.metainfo.xml
+      - install -Dm644 data/icons/hicolor/scalable/apps/tech.jptr.jmail.svg
+        /app/share/icons/hicolor/scalable/apps/tech.jptr.jmail.svg
+    sources:
+      - type: file
+        path: Cargo.toml
+      - type: file
+        path: Cargo.lock
+      - type: dir
+        path: crates
+        dest: crates
+      - type: dir
+        path: data
+        dest: data
+      - build-aux/flatpak/cargo-sources.json

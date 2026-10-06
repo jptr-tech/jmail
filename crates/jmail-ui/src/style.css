@@ -1,0 +1,41 @@
+/* Jmail application stylesheet. */
+
+/* The "alive" indicator in the header bar. Deliberately static: it only tells
+   you the application is running. */
+.status-dot {
+  min-width: 9px;
+  min-height: 9px;
+  border-radius: 99px;
+  background-color: @success_color;
+  box-shadow: 0 0 0 1px alpha(@success_color, 0.35);
+  margin: 0 8px;
+}
+
+.folder-pane {
+  background-color: @sidebar_bg_color;
+}
+
+/* Message list rows. */
+.message-row .msg-subject {
+  font-weight: 400;
+}
+
+.message-row.unread .msg-subject {
+  font-weight: 700;
+}
+
+.msg-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 99px;
+  background-color: @accent_bg_color;
+}
+
+.msg-star {
+  color: @warning_color;
+}
+
+/* Conversation view. */
+.conversation-message {
+  border-bottom: 1px solid alpha(@borders, 0.5);
+}

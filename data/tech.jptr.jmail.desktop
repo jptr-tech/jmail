@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Jmail
+GenericName=Email Client
+Comment=Fast, keyboard-driven email
+Exec=jmail
+Icon=tech.jptr.jmail
+Terminal=false
+Type=Application
+Categories=Network;Email;
+Keywords=email;mail;imap;smtp;gmail;
+StartupNotify=true

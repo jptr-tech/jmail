@@ -1,0 +1,25 @@
+[package]
+name = "jmail-mock-imap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "jmail-mock-imap"
+path = "src/main.rs"
+
+[dependencies]
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+imap-proto.workspace = true

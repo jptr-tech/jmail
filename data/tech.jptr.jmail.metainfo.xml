@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>tech.jptr.jmail</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Jmail</name>
+  <summary>Fast, keyboard-driven email</summary>
+  <description>
+    <p>
+      Jmail is a GTK4 email client with Vim-style, Gmail-compatible keyboard
+      shortcuts, a joined inbox, a fast local cache and a Gmail-style
+      conversation view.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>OAuth sign-in for Google, IMAP/SMTP for other providers</li>
+      <li>Unified inbox across accounts with folders and special-use mailboxes</li>
+      <li>Local SQLite cache with full-text search</li>
+      <li>Automatic background sync with IMAP IDLE and polling fallback</li>
+      <li>Optional desktop notifications</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">tech.jptr.jmail.desktop</launchable>
+  <url type="homepage">https://github.com/jptr/jmail</url>
+  <url type="bugtracker">https://github.com/jptr/jmail/issues</url>
+  <developer id="tech.jptr">
+    <name>jptr</name>
+  </developer>
+  <branding>
+    <color type="primary" scheme_preference="light">#673ab7</color>
+    <color type="primary" scheme_preference="dark">#7e57c2</color>
+  </branding>
+  <provides>
+    <binary>jmail</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-05">
+      <description>
+        <p>Initial development milestone: application shell and layout.</p>
+      </description>
+    </release>
+  </releases>
+</component>
