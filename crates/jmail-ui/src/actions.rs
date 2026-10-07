@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::gio;
+use gtk::glib;
 use gtk::glib::BoxedAnyObject;
+use gtk::subclass::prelude::*;
 
-use jmail_core::{AccountId, Attachment, Db, MessageId, SpecialUse, SyncCommand};
+use jmail_core::{AccountId, Attachment, Db, MessageId, SpecialUse, SyncCommand, ThreadFilter};
 
 use crate::message_row::{format_timestamp, MessageRow};
 use crate::window::Ui;
@@ -60,7 +62,11 @@ pub fn install_window_actions(ui: &Ui) {
     // Compose.
     on(ui, "compose", {
         let ui = ui.clone();
-        move || crate::compose::present(Some(&ui.window), crate::compose::Mode::New, None)
+        move || crate::compose::present(&ui, crate::compose::Mode::New, None)
+    });
+    on(ui, "discard-reply", {
+        let ui = ui.clone();
+        move || ui.clear_inline()
     });
     for (name, mode) in [
         ("reply", crate::compose::Mode::Reply),
@@ -68,9 +74,12 @@ pub fn install_window_actions(ui: &Ui) {
         ("forward", crate::compose::Mode::Forward),
     ] {
         let handle = ui.clone();
-        on(ui, name, move || {
-            let subject = selected_subject(&handle);
-            crate::compose::present(Some(&handle.window), mode, subject);
+        on(ui, name, move || match selected_row(&handle) {
+            Some(row) => {
+                let target = reply_target_id(&handle, &row);
+                crate::compose::present_inline(&handle, mode, target);
+            }
+            None => handle.status_label.set_text("Select a message first"),
         });
     }
 
@@ -119,16 +128,25 @@ pub fn install_window_actions(ui: &Ui) {
     });
 
     // Folder jumps.
-    for (name, folder) in [
-        ("go-inbox", "Joined Inbox"),
-        ("go-sent", "Sent"),
-        ("go-drafts", "Drafts"),
-        ("go-all", "All Mail"),
-    ] {
+    let views: [(&str, &str, Option<SpecialUse>, bool); 4] = [
+        ("go-inbox", "Joined Inbox", None, false),
+        ("go-sent", "Sent", Some(SpecialUse::Sent), false),
+        ("go-drafts", "Drafts", Some(SpecialUse::Drafts), false),
+        ("go-all", "All Mail", None, true),
+    ];
+    for (name, label, special, all) in views {
         let handle = ui.clone();
         on(ui, name, move || {
-            handle.window_title.set_subtitle(folder);
-            handle.status_label.set_text(&format!("Go to {folder}"));
+            let filter = if all {
+                ThreadFilter::All
+            } else if let Some(special) = special {
+                first_folder(&handle.db, special)
+                    .map(ThreadFilter::Folder)
+                    .unwrap_or(ThreadFilter::Unified)
+            } else {
+                ThreadFilter::Unified
+            };
+            crate::window::set_view(&handle, label, filter);
         });
     }
 
@@ -162,8 +180,62 @@ fn row_at(ui: &Ui, position: u32) -> Option<MessageRow> {
     Some(row)
 }
 
-fn selected_subject(ui: &Ui) -> Option<String> {
-    selected_row(ui).map(|row| row.subject)
+/// The first folder with the given special use across all accounts.
+fn first_folder(db: &Db, special: SpecialUse) -> Option<jmail_core::FolderId> {
+    for account in db.accounts().ok()? {
+        if let Some(folder) = db
+            .folders(account.id)
+            .ok()?
+            .into_iter()
+            .find(|folder| folder.special_use == special)
+        {
+            return Some(folder.id);
+        }
+    }
+    None
+}
+
+/// Whether the row represents a draft.
+fn is_draft(ui: &Ui, row: &MessageRow) -> bool {
+    ui.db.get_message(MessageId(row.id))
+        .ok()
+        .flatten()
+        .map(|message| message.flags.draft)
+        .unwrap_or(false)
+}
+
+/// Which message in the conversation a reply/forward should target: the latest
+/// message in the thread.
+fn reply_target_id(ui: &Ui, row: &MessageRow) -> Option<MessageId> {
+    let messages = ui
+        .db
+        .thread_messages(AccountId(row.account_id), &row.thread_id, 50)
+        .unwrap_or_default();
+    jmail_core::select_reply_target(&messages)
+        .map(|message| message.id)
+        .or(Some(MessageId(row.id)))
+}
+
+/// Open a draft in the composer, fetching its body first if needed.
+fn open_draft(ui: &Ui, row: &MessageRow) {
+    let message = MessageId(row.id);
+    let has_body = ui
+        .db
+        .message_body(message)
+        .ok()
+        .flatten()
+        .and_then(|body| body.text)
+        .is_some();
+    if has_body {
+        crate::compose::present(ui, crate::compose::Mode::Draft, Some(message));
+        return;
+    }
+    *ui.pending_draft.borrow_mut() = Some(message);
+    let account = AccountId(row.account_id);
+    if ui.engine.is_running(account) {
+        ui.engine.send(account, SyncCommand::FetchBody { message });
+    }
+    ui.status_label.set_text("Loading draft…");
 }
 
 /// Move the selection by `delta` through the filtered list.
@@ -206,6 +278,10 @@ fn open_pane(ui: &Ui) {
     let Some(row) = selected_row(ui) else {
         return;
     };
+    if is_draft(ui, &row) {
+        open_draft(ui, &row);
+        return;
+    }
     begin_preview(ui, &row, true);
 }
 
@@ -215,11 +291,25 @@ fn open_window(ui: &Ui) {
         ui.status_label.set_text("No message selected");
         return;
     };
+    if is_draft(ui, &row) {
+        open_draft(ui, &row);
+        return;
+    }
     open_message_window(ui, &row);
 }
 
 /// Render a preview and schedule marking it read after a short delay.
 fn begin_preview(ui: &Ui, row: &MessageRow, show_content: bool) {
+    // Switching to a different conversation discards any inline reply.
+    let switched = ui
+        .preview_row
+        .borrow()
+        .as_ref()
+        .is_some_and(|previous| previous.thread_id != row.thread_id);
+    if switched {
+        ui.clear_inline();
+    }
+
     let generation = ui.preview_generation.get().wrapping_add(1);
     ui.preview_generation.set(generation);
     *ui.preview_row.borrow_mut() = Some(row.clone());
@@ -246,6 +336,7 @@ fn render_preview(ui: &Ui, row: &MessageRow) {
     let theme = html_theme(&ui.conversation);
     ui.reading_subject.set_label(&row.subject);
     ui.reading_empty.set_visible(false);
+    ui.reply_bar.set_visible(true);
 
     let data = thread_render_data(&ui.db, row);
 
@@ -256,8 +347,16 @@ fn render_preview(ui: &Ui, row: &MessageRow) {
     let mut cells = ui.cells.borrow_mut();
     while cells.len() < data.len() {
         let cell = MessageCell::new(&theme);
-        ui.conversation.append(&cell.root);
+        ui.messages_box.append(&cell.root);
         cells.push(cell);
+    }
+    // Defensive: make sure every reused cell really lives in `messages_box`
+    // (before the compose slot), so message order can't be scrambled.
+    let target: gtk::Widget = ui.messages_box.clone().upcast();
+    for cell in cells.iter() {
+        if cell.root.parent().as_ref() != Some(&target) {
+            ui.messages_box.append(&cell.root);
+        }
     }
     for (cell, message) in cells.iter().zip(data.iter()) {
         cell.root.set_visible(true);
@@ -299,7 +398,7 @@ fn thread_render_data(db: &Db, row: &MessageRow) -> Vec<RenderedMessage> {
         }];
     }
 
-    let senders = sender_by_message_id(&messages);
+    let senders = sender_by_message_id(&messages, &my_addresses(db));
 
     messages
         .iter()
@@ -332,18 +431,36 @@ fn thread_render_data(db: &Db, row: &MessageRow) -> Vec<RenderedMessage> {
 }
 
 /// Map every `Message-ID` in a conversation to its sender, so a reply can name
-/// who it answers.
-fn sender_by_message_id(messages: &[jmail_core::Message]) -> HashMap<String, String> {
+/// who it answers. Messages sent by one of `my_addresses` display as "You".
+fn sender_by_message_id(
+    messages: &[jmail_core::Message],
+    my_addresses: &[String],
+) -> HashMap<String, String> {
     let mut senders = HashMap::new();
     for message in messages {
         let id = jmail_core::threading::normalize_message_id(&message.message_id);
         if !id.is_empty() {
-            senders
-                .entry(id)
-                .or_insert_with(|| message.from.display().to_string());
+            let is_mine = my_addresses
+                .iter()
+                .any(|mine| mine.eq_ignore_ascii_case(&message.from.email));
+            let display = if is_mine {
+                "You".to_string()
+            } else {
+                message.from.display().to_string()
+            };
+            senders.entry(id).or_insert(display);
         }
     }
     senders
+}
+
+/// The account addresses belonging to the user.
+fn my_addresses(db: &Db) -> Vec<String> {
+    db.accounts()
+        .unwrap_or_default()
+        .iter()
+        .map(|account| account.email.clone())
+        .collect()
 }
 
 fn reply_to_name(senders: &HashMap<String, String>, in_reply_to: &str) -> Option<String> {
@@ -357,6 +474,84 @@ fn reply_to_name(senders: &HashMap<String, String>, in_reply_to: &str) -> Option
                 .cloned()
                 .unwrap_or_else(|| "an earlier message".to_string()),
         )
+    }
+}
+
+mod auto_height {
+    use gtk::glib;
+    use gtk::prelude::*;
+    use gtk::subclass::prelude::*;
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Default)]
+    pub struct AutoHeight {
+        pub child: RefCell<Option<gtk::Widget>>,
+        pub height: Cell<i32>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for AutoHeight {
+        const NAME: &'static str = "JmailAutoHeight";
+        type Type = super::AutoHeight;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for AutoHeight {
+        fn dispose(&self) {
+            if let Some(child) = self.child.borrow_mut().take() {
+                child.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for AutoHeight {
+        fn measure(
+            &self,
+            orientation: gtk::Orientation,
+            for_size: i32,
+        ) -> (i32, i32, i32, i32) {
+            if orientation == gtk::Orientation::Vertical {
+                let height = self.height.get();
+                (height, height, -1, -1)
+            } else if let Some(child) = self.child.borrow().as_ref() {
+                child.measure(orientation, for_size)
+            } else {
+                (0, 0, -1, -1)
+            }
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            if let Some(child) = self.child.borrow().as_ref() {
+                child.allocate(width, height, baseline, None);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    /// A container that gives its single child an exact height.
+    ///
+    /// `gtk_widget_set_size_request` only sets a *minimum*, and a reused
+    /// `WebKitWebView`'s natural height sticks at the largest value it has seen
+    /// (floored at the viewport), so it cannot shrink. This ignores the child's
+    /// natural height and reports the height set via [`AutoHeight::set_height`].
+    pub struct AutoHeight(ObjectSubclass<auto_height::AutoHeight>) @extends gtk::Widget, @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl AutoHeight {
+    pub(crate) fn new(view: &webkit6::WebView) -> Self {
+        let holder: Self = glib::Object::new();
+        view.set_parent(&holder);
+        holder.imp().child.replace(Some(view.clone().upcast()));
+        holder
+    }
+
+    /// Set the exact height this container (and its child) will take.
+    pub(crate) fn set_height(&self, height: i32) {
+        if self.imp().height.get() != height {
+            self.imp().height.set(height);
+            self.queue_resize();
+        }
     }
 }
 
@@ -420,16 +615,23 @@ impl MessageCell {
         view.set_background_color(&theme.bg);
         view.set_hexpand(true);
         view.set_vexpand(false);
-        view.set_size_request(-1, 140);
         // Keep the (reused) surface hidden until it has painted its content.
         view.set_opacity(0.0);
 
+        // Force the cell to the measured body height: a reused WebView's
+        // natural height otherwise sticks at the largest value it has seen.
+        let holder = AutoHeight::new(&view);
+        holder.set_hexpand(true);
+        holder.set_height(140);
+        install_height_messaging(&view, &holder);
+
         {
             let view = view.clone();
+            let holder = holder.clone();
             view.connect_load_changed(move |view, event| {
                 if event == webkit6::LoadEvent::Finished {
-                    measure_view_height(view);
-                    view.set_opacity(1.0);
+                    // Reveal only once the content height has been measured.
+                    measure_view_height(view, &holder, true);
                 }
             });
         }
@@ -442,16 +644,19 @@ impl MessageCell {
         }
         // Re-measure whenever the allocated width changes (the pane was resized).
         let last_width = Rc::new(std::cell::Cell::new(0));
-        view.add_tick_callback(move |view, _clock| {
-            let width = view.width();
-            if width != last_width.get() {
-                last_width.set(width);
-                measure_view_height(view);
-            }
-            gtk::glib::ControlFlow::Continue
-        });
+        {
+            let holder = holder.clone();
+            view.add_tick_callback(move |view, _clock| {
+                let width = view.width();
+                if width != last_width.get() {
+                    last_width.set(width);
+                    measure_view_height(view, &holder, false);
+                }
+                gtk::glib::ControlFlow::Continue
+            });
+        }
 
-        root.append(&view);
+        root.append(&holder);
 
         let attachments_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
         attachments_box.set_visible(false);
@@ -545,7 +750,7 @@ pub(crate) fn preload_reading_pane(ui: &Ui) {
     let mut cells = ui.cells.borrow_mut();
     if cells.is_empty() {
         let cell = MessageCell::new(&theme);
-        ui.conversation.append(&cell.root);
+        ui.messages_box.append(&cell.root);
         cells.push(cell);
     }
     cells[0].warm(&theme);
@@ -596,6 +801,47 @@ fn install_webview_policy(view: &webkit6::WebView) {
         }
         None
     });
+}
+
+/// Keep the `AutoHeight` container in sync when the page re-lays-out (for
+/// example when a "Show quoted text" `<details>` is expanded): a user script
+/// posts the document height whenever a `details` element toggles.
+fn install_height_messaging(view: &webkit6::WebView, holder: &AutoHeight) {
+    use webkit6::prelude::*;
+
+    const NAME: &str = "jmailHeight";
+    const SCRIPT: &str = r#"
+document.addEventListener('toggle', function (event) {
+    var el = event.target;
+    if (el && el.tagName === 'DETAILS') {
+        var h = Math.ceil(Math.max(document.body.scrollHeight,
+                                   document.body.getBoundingClientRect().height));
+        window.webkit.messageHandlers.jmailHeight.postMessage(h);
+    }
+}, true);
+"#;
+
+    let Some(manager) = view.user_content_manager() else {
+        return;
+    };
+    manager.register_script_message_handler(NAME, None);
+    {
+        let holder = holder.clone();
+        manager.connect_script_message_received(Some(NAME), move |_, value| {
+            let height = value.to_double();
+            if height > 0.0 {
+                holder.set_height(height.ceil() as i32 + 2);
+            }
+        });
+    }
+    let script = webkit6::UserScript::new(
+        SCRIPT,
+        webkit6::UserContentInjectedFrames::TopFrame,
+        webkit6::UserScriptInjectionTime::End,
+        &[],
+        &[],
+    );
+    manager.add_script(&script);
 }
 
 /// Open a link with the desktop's URI handler (Android/iOS-style handoff via
@@ -763,6 +1009,10 @@ fn text_body_html(text: &str) -> String {
 pub(crate) fn reload_preview(ui: &Ui) {
     if let Some(row) = ui.preview_row.borrow().clone() {
         render_preview(ui, &row);
+        // Also request any bodies that arrived since the conversation was
+        // opened (e.g. a just-sent Sent copy), so it renders without needing a
+        // re-open. Already-cached messages are skipped.
+        ensure_thread_bodies(ui, &row);
     }
 }
 
@@ -1068,7 +1318,7 @@ fn conversation_message_widgets(
             ready,
         )];
     }
-    let senders = sender_by_message_id(&messages);
+    let senders = sender_by_message_id(&messages, &my_addresses(db));
     messages
         .iter()
         .map(|message| {
@@ -1175,10 +1425,15 @@ fn html_body(html: &str, theme: &HtmlTheme, ready: Option<PreviewReady>) -> gtk:
     view.set_background_color(&theme.bg);
     view.set_hexpand(true);
     view.set_vexpand(false);
-    view.set_size_request(-1, 140);
     // Keep the view invisible until it has actually rendered, so the pane never
     // shows WebKit's uninitialised (black) compositing surface.
     view.set_opacity(0.0);
+
+    // Force the body to its measured content height (see `AutoHeight`).
+    let holder = AutoHeight::new(&view);
+    holder.set_hexpand(true);
+    holder.set_height(140);
+    install_height_messaging(&view, &holder);
 
     let finish: Rc<dyn Fn()> = {
         let view = view.clone();
@@ -1206,9 +1461,10 @@ fn html_body(html: &str, theme: &HtmlTheme, ready: Option<PreviewReady>) -> gtk:
 
     {
         let finish = finish.clone();
+        let holder = holder.clone();
         view.connect_load_changed(move |view, event| {
             if event == webkit6::LoadEvent::Finished {
-                measure_view_height(view);
+                measure_view_height(view, &holder, false);
                 // `Finished` only means the load completed; wait for the next
                 // frame tick so WebKit has actually painted before revealing.
                 let finish = finish.clone();
@@ -1226,34 +1482,51 @@ fn html_body(html: &str, theme: &HtmlTheme, ready: Option<PreviewReady>) -> gtk:
     }
     // Re-measure whenever the allocated width changes (the pane was resized).
     let last_width = std::rc::Rc::new(std::cell::Cell::new(0));
-    view.add_tick_callback(move |view, _clock| {
-        let width = view.width();
-        if width != last_width.get() {
-            last_width.set(width);
-            measure_view_height(view);
-        }
-        gtk::glib::ControlFlow::Continue
-    });
-    view.upcast()
+    {
+        let holder = holder.clone();
+        view.add_tick_callback(move |view, _clock| {
+            let width = view.width();
+            if width != last_width.get() {
+                last_width.set(width);
+                measure_view_height(view, &holder, false);
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+    }
+    holder.upcast()
 }
 
-fn measure_view_height(view: &webkit6::WebView) {
+/// Measure the body content height and apply it to the `AutoHeight` container.
+///
+/// The measurement deliberately ignores the document root: `documentElement`
+/// scroll height is floored at the view's current viewport, which would stop the
+/// view from ever shrinking. `themed_html` supplies a doctype so the body is in
+/// standards mode, where `body` reports the real content height (in quirks mode
+/// the body stretches to the viewport, which is what made this look stuck). When
+/// `reveal` is set, the view is made visible only after the height is applied.
+fn measure_view_height(view: &webkit6::WebView, holder: &AutoHeight, reveal: bool) {
     use webkit6::prelude::*;
 
-    let target = view.clone();
+    let holder = holder.clone();
+    let view_for_reveal = view.clone();
     view.evaluate_javascript(
-        "Math.ceil(Math.max(document.body.scrollHeight, document.documentElement.scrollHeight))",
+        "Math.ceil(Math.max(document.body.scrollHeight, document.body.getBoundingClientRect().height))",
         None,
         None,
         None::<&gtk::gio::Cancellable>,
-        move |result| match result {
-            Ok(value) => {
-                let height = value.to_double();
-                if height > 0.0 {
-                    target.set_size_request(-1, height.ceil() as i32 + 2);
+        move |result| {
+            match result {
+                Ok(value) => {
+                    let height = value.to_double();
+                    if height > 0.0 {
+                        holder.set_height(height.ceil() as i32 + 2);
+                    }
                 }
+                Err(error) => tracing::debug!(%error, "could not measure HTML body height"),
             }
-            Err(error) => tracing::debug!(%error, "could not measure HTML body height"),
+            if reveal {
+                view_for_reveal.set_opacity(1.0);
+            }
         },
     );
 }
@@ -1280,7 +1553,7 @@ th, td { border: 1px solid rgba(127,127,127,0.4); padding: 4px 8px; }
         .replace("__BG__", &rgba_hex(&theme.bg))
         .replace("__FG__", &theme.fg)
         .replace("__ACCENT__", &theme.accent);
-    format!("{style}{}", sanitize_html(html))
+    format!("<!DOCTYPE html>{style}{}", sanitize_html(html))
 }
 
 /// Remove active/remote content (`script`, `iframe`, `object`, `embed`) from an

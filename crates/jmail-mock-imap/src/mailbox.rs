@@ -18,6 +18,7 @@ pub struct MockMessage {
     pub from_name: String,
     pub from_email: String,
     pub to: Vec<(String, String)>,
+    pub reply_to: Vec<(String, String)>,
     pub message_id: String,
     pub in_reply_to: String,
     pub references: Vec<String>,
@@ -26,6 +27,9 @@ pub struct MockMessage {
     pub html: Option<String>,
     pub attachments: Vec<MockAttachment>,
     pub flags: Vec<String>,
+    /// When set, `raw()` returns these bytes verbatim (used for messages
+    /// appended by the client, whose MIME structure must be preserved).
+    pub raw_override: Option<String>,
 }
 
 impl MockMessage {
@@ -49,6 +53,7 @@ impl MockMessage {
                 .iter()
                 .map(|(name, email)| (name.to_string(), email.to_string()))
                 .collect(),
+            reply_to: Vec::new(),
             message_id: message_id.to_string(),
             in_reply_to: String::new(),
             references: Vec::new(),
@@ -57,6 +62,7 @@ impl MockMessage {
             html: None,
             attachments: Vec::new(),
             flags: flags.iter().map(|f| f.to_string()).collect(),
+            raw_override: None,
         }
     }
 
@@ -94,8 +100,84 @@ impl MockMessage {
         self
     }
 
+    /// Set a `Reply-To` address (e.g. a mailing list).
+    pub fn with_reply_to(mut self, addresses: &[(&str, &str)]) -> Self {
+        self.reply_to = addresses
+            .iter()
+            .map(|(name, email)| (name.to_string(), email.to_string()))
+            .collect();
+        self
+    }
+
+    /// Build a message from bytes appended by the client (`APPEND`). Structured
+    /// fields are parsed from the headers so ENVELOPE works; the bytes are kept
+    /// verbatim for `BODY[]`.
+    pub fn from_raw(raw: &[u8], flags: &[String]) -> Self {
+        let text = String::from_utf8_lossy(raw).to_string();
+        let (header_block, _body) = text
+            .split_once("\r\n\r\n")
+            .or_else(|| text.split_once("\n\n"))
+            .unwrap_or((text.as_str(), ""));
+
+        let mut headers: Vec<(String, String)> = Vec::new();
+        for line in header_block.lines() {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                if let Some(last) = headers.last_mut() {
+                    last.1.push(' ');
+                    last.1.push_str(line.trim());
+                }
+            } else if let Some((name, value)) = line.split_once(':') {
+                headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+            }
+        }
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        let ids = |value: &str| -> Vec<String> {
+            value
+                .split_whitespace()
+                .map(|token| token.trim_matches(|c| c == '<' || c == '>').to_string())
+                .filter(|token| !token.is_empty())
+                .collect()
+        };
+
+        let (from_name, from_email) = parse_single_address(&get("from"));
+        let to = parse_address_list(&get("to"));
+        let reply_to = parse_address_list(&get("reply-to"));
+        Self {
+            uid: 0,
+            subject: get("subject"),
+            from_name,
+            from_email,
+            to,
+            reply_to,
+            message_id: get("message-id")
+                .trim_matches(|c| c == '<' || c == '>')
+                .trim()
+                .to_string(),
+            in_reply_to: get("in-reply-to")
+                .trim_matches(|c| c == '<' || c == '>')
+                .trim()
+                .to_string(),
+            references: ids(&get("references")),
+            date: get("date"),
+            text: String::new(),
+            html: None,
+            attachments: Vec::new(),
+            flags: flags.to_vec(),
+            raw_override: Some(text),
+        }
+    }
+
     /// The message as an RFC 822 byte string.
     pub fn raw(&self) -> String {
+        if let Some(raw) = &self.raw_override {
+            return raw.clone();
+        }
         let from = if self.from_name.is_empty() {
             format!("<{}>", self.from_email)
         } else {
@@ -111,6 +193,15 @@ impl MockMessage {
             "Message-ID: <{}>\r\nDate: {}\r\nSubject: {}\r\nFrom: {}\r\nTo: {}",
             self.message_id, self.date, self.subject, from, to
         );
+        if !self.reply_to.is_empty() {
+            let reply_to = self
+                .reply_to
+                .iter()
+                .map(|(name, email)| format!("{name} <{email}>"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            headers.push_str(&format!("\r\nReply-To: {reply_to}"));
+        }
         if !self.in_reply_to.is_empty() {
             headers.push_str(&format!("\r\nIn-Reply-To: <{}>", self.in_reply_to));
         }
@@ -166,11 +257,23 @@ impl MockMessage {
     /// `(date subject from sender reply-to to cc bcc in-reply-to message-id)`
     pub(crate) fn envelope(&self) -> String {
         let addr = |(name, email): &(String, String)| {
-            format!("({} NIL {:?} {:?})", quote(name), email, email)
+            let (mailbox, host) = split_email(email);
+            format!("({} NIL {:?} {:?})", quote(name), mailbox, host)
         };
-        let address_group = format!("({} NIL {:?} {:?})", quote(&self.from_name), self.from_email, self.from_email);
+        let (from_mailbox, from_host) = split_email(&self.from_email);
+        let address_group = format!(
+            "({} NIL {:?} {:?})",
+            quote(&self.from_name),
+            from_mailbox,
+            from_host
+        );
         // `from`, `sender` and `reply_to` are address *lists* wrapped in parens.
         let from = format!("({address_group})");
+        let reply_to = if self.reply_to.is_empty() {
+            from.clone()
+        } else {
+            format!("({})", self.reply_to.iter().map(addr).collect::<Vec<_>>().join(" "))
+        };
         let to = if self.to.is_empty() {
             "NIL".to_string()
         } else {
@@ -182,7 +285,7 @@ impl MockMessage {
             format!("{:?}", self.in_reply_to)
         };
         format!(
-            "({:?} {:?} {from} {from} {from} {to} NIL NIL {in_reply_to} {:?})",
+            "({:?} {:?} {from} {from} {reply_to} {to} NIL NIL {in_reply_to} {:?})",
             self.date, self.subject, self.message_id,
         )
     }
@@ -198,6 +301,32 @@ impl MockMessage {
 
 pub(crate) fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Parse `Name <email>` or a bare address.
+fn parse_single_address(input: &str) -> (String, String) {
+    let input = input.trim();
+    if let Some((name, rest)) = input.rsplit_once('<') {
+        let email = rest.trim_end_matches('>').trim().to_string();
+        let name = name.trim().trim_matches('"').trim().to_string();
+        (name, email)
+    } else {
+        (String::new(), input.to_string())
+    }
+}
+
+/// Parse a comma-separated address list.
+fn parse_address_list(input: &str) -> Vec<(String, String)> {
+    input
+        .split(',')
+        .map(parse_single_address)
+        .filter(|(_, email)| !email.is_empty())
+        .collect()
+}
+
+/// Split `local@host` for the IMAP ENVELOPE address tuple.
+fn split_email(email: &str) -> (&str, &str) {
+    email.split_once('@').unwrap_or((email, ""))
 }
 
 /// RFC 4648 base64 (standard alphabet, `=` padding) for attachment bodies.
@@ -246,6 +375,8 @@ pub struct MockFolder {
     /// LIST attributes, e.g. `\Sent`, `\HasNoChildren`.
     pub attrs: Vec<String>,
     pub messages: Vec<MockMessage>,
+    /// Monotonic next UID (RFC 3501 UIDNEXT), even across expunges.
+    pub next_uid: u32,
 }
 
 impl MockFolder {
@@ -254,6 +385,7 @@ impl MockFolder {
             name: name.to_string(),
             attrs: attrs.iter().map(|a| a.to_string()).collect(),
             messages: Vec::new(),
+            next_uid: 1,
         }
     }
 
@@ -262,7 +394,7 @@ impl MockFolder {
     }
 
     pub fn uidnext(&self) -> u32 {
-        self.exists() + 1
+        self.next_uid.max(1)
     }
 
     /// The RFC 6154 special-use attribute, if any.
@@ -337,12 +469,13 @@ impl MockMailbox {
             .find(|f| f.name.eq_ignore_ascii_case(name))
     }
 
-    /// Append a message, returning its UID (1-based per folder).
+    /// Append a message, returning its UID (monotonic per folder).
     pub fn push(&mut self, folder: &str, message: MockMessage) -> u32 {
         let Some(folder) = self.folder_mut(folder) else {
             return 0;
         };
         let uid = folder.uidnext();
+        folder.next_uid = uid + 1;
         let mut message = message;
         message.uid = uid;
         folder.messages.push(message);
@@ -398,7 +531,8 @@ impl MockMailbox {
             MockMessage::new("Quarterly report", "Grace Hopper", "grace@example.org", &me, "m3@example.org", "Sun, 04 Oct 2026 14:05:00 +0000", "Attached is the quarterly report.", &[])
                 .with_attachment("quarterly-report.pdf", "application/pdf", b"%PDF-1.4 mock quarterly report\n"),
             MockMessage::new("Re: Quarterly report", "Grace Hopper", "grace@example.org", &me, "m4@example.org", "Sun, 04 Oct 2026 18:44:00 +0000", "Thanks, reviewed it.", &["\\Seen", "\\Flagged"])
-                .reply_to("m3@example.org"),
+                .reply_to("m3@example.org")
+                .with_reply_to(&[("Reports", "reports@example.org")]),
             MockMessage::new("Lunch tomorrow?", "Alan Turing", "alan@example.org", &me, "m5@example.org", "Fri, 02 Oct 2026 11:00:00 +0000", "Fancy lunch at noon?", &[]),
         ];
         for message in inbox {

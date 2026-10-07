@@ -291,14 +291,17 @@ impl ImapSession {
             .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
             .await
             .map_err(protocol)?;
+        // Drain the whole response stream: returning early would leave the
+        // tagged completion buffered and corrupt the next command.
+        let mut body = None;
         tokio::pin!(stream);
         while let Some(fetch) = stream.next().await {
             let fetch = fetch.map_err(protocol)?;
-            if let Some(body) = fetch.body() {
-                return Ok(Some(body.to_vec()));
+            if body.is_none() {
+                body = fetch.body().map(|body| body.to_vec());
             }
         }
-        Ok(None)
+        Ok(body)
     }
 
     /// Replace a message's flags on the server.
@@ -351,6 +354,36 @@ impl ImapSession {
             .uid_copy(uid.to_string(), destination)
             .await
             .map_err(protocol)?;
+        {
+            let stream = self
+                .session
+                .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+                .await
+                .map_err(protocol)?;
+            tokio::pin!(stream);
+            while let Some(item) = stream.next().await {
+                item.map_err(protocol)?;
+            }
+        }
+        let stream = self.session.expunge().await.map_err(protocol)?;
+        tokio::pin!(stream);
+        while let Some(item) = stream.next().await {
+            item.map_err(protocol)?;
+        }
+        Ok(())
+    }
+
+    /// Append a raw RFC 5322 message to `path` with the given flags.
+    pub async fn append(&mut self, path: &str, flags: &str, raw: &[u8]) -> Result<()> {
+        self.session
+            .append(path, Some(flags), None, raw)
+            .await
+            .map_err(protocol)
+    }
+
+    /// Permanently remove a message by UID (`\Deleted` + `EXPUNGE`).
+    pub async fn delete_message(&mut self, path: &str, uid: u32) -> Result<()> {
+        self.select(path).await?;
         {
             let stream = self
                 .session
@@ -502,6 +535,7 @@ fn server_message_from(fetch: Fetch) -> Option<ServerMessage> {
             .unwrap_or_else(|| Address::new("", "")),
         to: address_list(envelope.to.as_ref()),
         cc: address_list(envelope.cc.as_ref()),
+        reply_to: address_list(envelope.reply_to.as_ref()),
         date,
         flags,
         snippet: String::new(),

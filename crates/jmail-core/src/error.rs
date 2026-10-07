@@ -27,6 +27,9 @@ pub enum Error {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    #[error("send error: {0}")]
+    Send(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 

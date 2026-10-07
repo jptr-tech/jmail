@@ -20,13 +20,21 @@ async fn main() {
         .and_then(|index| std::env::args().nth(index + 1))
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(1143);
+    // A stable SMTP port by default, so the account's saved setting survives
+    // restarts (0 would pick a new free port each time).
+    let smtp_port = std::env::args()
+        .position(|arg| arg == "--smtp-port")
+        .and_then(|index| std::env::args().nth(index + 1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(2525);
     let push_after = std::env::args()
         .position(|arg| arg == "--push-after")
         .and_then(|index| std::env::args().nth(index + 1))
         .and_then(|value| value.parse::<u64>().ok());
 
     let config = {
-        let config = MockConfig::new("you@example.com", "hunter2");
+        let config =
+            MockConfig::new("you@example.com", "hunter2").with_smtp_port(smtp_port);
         if with_tls {
             config.with_tls()
         } else {
@@ -38,6 +46,7 @@ async fn main() {
         .await
         .expect("start mock server");
     println!("Mock IMAP listening on 127.0.0.1:{} (user you@example.com / hunter2)", server.addr().port());
+    println!("Mock SMTP listening on 127.0.0.1:{}", server.smtp_addr().port());
     if let Some(cert) = server.cert_der() {
         println!("TLS enabled; cert sha256 present ({} bytes)", cert.len());
     } else {

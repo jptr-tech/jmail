@@ -20,7 +20,7 @@ use crate::folder::{Folder, FolderId, SpecialUse};
 use crate::message::{Address, Attachment, Flags, Message, MessageBody, MessageId, NewMessage};
 
 /// Bump when the schema changes and add a matching migration step.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// A conversation as shown in the unified inbox: the latest message plus
 /// aggregate counts.
@@ -30,6 +30,17 @@ pub struct ThreadSummary {
     pub count: u32,
     pub unread: u32,
     pub starred: u32,
+}
+
+/// Which messages a conversation list should cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadFilter {
+    /// Every account's Inbox, grouped by conversation.
+    Unified,
+    /// A single folder (Inbox/Sent/Drafts/…), grouped by conversation.
+    Folder(FolderId),
+    /// Every cached message, grouped by conversation.
+    All,
 }
 
 /// Handle to the on-disk SQLite cache. Cheap to clone; all clones share one
@@ -93,6 +104,9 @@ impl Db {
         }
         if version < 4 {
             conn.execute_batch(SCHEMA_V4).map_err(storage)?;
+        }
+        if version < 5 {
+            conn.execute_batch(SCHEMA_V5).map_err(storage)?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(storage)?;
@@ -259,13 +273,15 @@ impl Db {
         let conn = self.lock()?;
         let to_json = serde_json::to_string(&message.to).unwrap_or_else(|_| "[]".into());
         let cc_json = serde_json::to_string(&message.cc).unwrap_or_else(|_| "[]".into());
+        let reply_to_json =
+            serde_json::to_string(&message.reply_to).unwrap_or_else(|_| "[]".into());
         let refs = message.references.join(" ");
         conn.execute(
             "INSERT INTO messages
                 (account_id, folder_id, uid, message_id, thread_id, subject,
                  from_name, from_email, to_json, cc_json, date, flags, snippet,
-                 has_attachments, body_text, body_html, in_reply_to, refs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                 has_attachments, body_text, body_html, in_reply_to, refs, reply_to_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
              ON CONFLICT(folder_id, uid) DO UPDATE SET
                 message_id = excluded.message_id,
                 thread_id = excluded.thread_id,
@@ -276,6 +292,7 @@ impl Db {
                 from_email = excluded.from_email,
                 to_json = excluded.to_json,
                 cc_json = excluded.cc_json,
+                reply_to_json = excluded.reply_to_json,
                 date = excluded.date,
                 flags = excluded.flags,
                 snippet = excluded.snippet,
@@ -301,6 +318,7 @@ impl Db {
                 message.body_html,
                 message.in_reply_to,
                 refs,
+                reply_to_json,
             ],
         )
         .map_err(storage)?;
@@ -352,10 +370,21 @@ impl Db {
     /// One row per conversation in the unified inbox: the latest message plus
     /// aggregate counts.
     pub fn unified_inbox_threads(&self, limit: u32) -> Result<Vec<ThreadSummary>> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(&format!(
-                "WITH ranked AS (
+        self.threads(ThreadFilter::Unified, limit)
+    }
+
+    /// One row per conversation for the given filter (see [`ThreadFilter`]).
+    pub fn threads(&self, filter: ThreadFilter, limit: u32) -> Result<Vec<ThreadSummary>> {
+        let (filter_where, filter_param): (&str, Option<i64>) = match filter {
+            ThreadFilter::Unified => (
+                "WHERE f.special_use = ?1",
+                Some(SpecialUse::Inbox.to_i64()),
+            ),
+            ThreadFilter::Folder(id) => ("WHERE m.folder_id = ?1", Some(id.0)),
+            ThreadFilter::All => ("WHERE (?1 IS NULL)", None),
+        };
+        let sql = format!(
+            "WITH ranked AS (
                     SELECT {MESSAGE_COLUMNS},
                            ROW_NUMBER() OVER (PARTITION BY m.account_id, m.thread_id
                                               ORDER BY m.date DESC, m.id DESC) AS rn,
@@ -366,18 +395,19 @@ impl Db {
                                OVER (PARTITION BY m.account_id, m.thread_id) AS starred
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
-                    WHERE f.special_use = ?1
+                    {filter_where}
                  )
                  SELECT * FROM ranked WHERE rn = 1 ORDER BY date DESC, id DESC LIMIT ?2"
-            ))
-            .map_err(storage)?;
+        );
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql).map_err(storage)?;
         let rows = stmt
-            .query_map(params![SpecialUse::Inbox.to_i64(), limit], |row| {
+            .query_map(params![filter_param, limit], |row| {
                 Ok(ThreadSummary {
                     message: map_message(row)?,
-                    count: row.get::<_, i64>(18)? as u32,
-                    unread: row.get::<_, i64>(19)? as u32,
-                    starred: row.get::<_, i64>(20)? as u32,
+                    count: row.get::<_, i64>(19)? as u32,
+                    unread: row.get::<_, i64>(20)? as u32,
+                    starred: row.get::<_, i64>(21)? as u32,
                 })
             })
             .map_err(storage)?
@@ -733,6 +763,29 @@ impl Db {
         Ok(message)
     }
 
+    /// Look up a cached message by its RFC 5322 `Message-ID`.
+    pub fn message_by_message_id(
+        &self,
+        account: AccountId,
+        message_id: &str,
+    ) -> Result<Option<Message>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {MESSAGE_COLUMNS} FROM messages m
+                 WHERE m.account_id = ?1 AND m.message_id = ?2
+                 ORDER BY m.id DESC LIMIT 1"
+            ))
+            .map_err(storage)?;
+        let message = stmt
+            .query_map(params![account.0, message_id], map_message)
+            .map_err(storage)?
+            .next()
+            .transpose()
+            .map_err(storage)?;
+        Ok(message)
+    }
+
     /// Store a fetched body (and derived snippet) for a cached message.
     pub fn set_body(
         &self,
@@ -1000,6 +1053,7 @@ impl Db {
             from: Address::new(name, email),
             to: vec![Address::new("", "you@example.com")],
             cc: Vec::new(),
+            reply_to: Vec::new(),
             date,
             flags: Flags {
                 seen: !unread,
@@ -1037,7 +1091,7 @@ fn storage(error: rusqlite::Error) -> Error {
 
 const MESSAGE_COLUMNS: &str = "m.id, m.account_id, m.folder_id, m.uid, m.message_id, \
     m.thread_id, m.subject, m.from_name, m.from_email, m.to_json, m.cc_json, \
-    m.date, m.flags, m.snippet, m.has_attachments, m.in_reply_to, m.refs";
+    m.date, m.flags, m.snippet, m.has_attachments, m.in_reply_to, m.refs, m.reply_to_json";
 
 fn map_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account {
@@ -1079,6 +1133,7 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     let cc_json: String = row.get(10)?;
     let date: i64 = row.get(11)?;
     let refs: String = row.get(16)?;
+    let reply_to_json: String = row.get(17)?;
     Ok(Message {
         id: MessageId(row.get(0)?),
         account_id: AccountId(row.get(1)?),
@@ -1093,6 +1148,7 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         },
         to: serde_json::from_str(&to_json).unwrap_or_default(),
         cc: serde_json::from_str(&cc_json).unwrap_or_default(),
+        reply_to: serde_json::from_str(&reply_to_json).unwrap_or_default(),
         date: OffsetDateTime::from_unix_timestamp(date).unwrap_or(OffsetDateTime::UNIX_EPOCH),
         flags: Flags::from_i64(row.get(12)?),
         snippet: row.get(13)?,
@@ -1216,6 +1272,11 @@ CREATE TABLE IF NOT EXISTS attachments (
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 "#;
 
+/// `Reply-To` header, stored as a JSON address list.
+const SCHEMA_V5: &str = r#"
+ALTER TABLE messages ADD COLUMN reply_to_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1265,6 +1326,7 @@ mod tests {
             from: Address::new("Sender", "sender@example.org"),
             to: vec![],
             cc: vec![],
+            reply_to: Vec::new(),
             date: OffsetDateTime::now_utc(),
             flags: Flags::default(),
             snippet: "hi".into(),
@@ -1303,6 +1365,7 @@ mod tests {
                 from: Address::new("Sender", "sender@example.org"),
                 to: vec![],
                 cc: vec![],
+                reply_to: Vec::new(),
                 date: OffsetDateTime::now_utc(),
                 flags: Flags::default(),
                 snippet: "hi".into(),
@@ -1363,6 +1426,7 @@ mod tests {
             from: Address::new("Sender", "sender@example.org"),
             to: vec![],
             cc: vec![],
+            reply_to: Vec::new(),
             date: OffsetDateTime::now_utc(),
             flags: Flags {
                 seen,

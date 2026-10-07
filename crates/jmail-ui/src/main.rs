@@ -2,6 +2,7 @@ mod actions;
 mod compose;
 mod context;
 mod keys;
+mod markdown_editor;
 mod message_row;
 mod settings;
 mod util;

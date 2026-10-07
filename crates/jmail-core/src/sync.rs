@@ -14,7 +14,9 @@ use crate::events::Event;
 use crate::folder::SpecialUse;
 use crate::imap::{ImapSession, ImapSettings, TlsTrust};
 use crate::message::{Attachment, Flags, MessageId};
+use crate::outgoing::{DraftRef, OutgoingAttachment, OutgoingMessage};
 use crate::secrets;
+use crate::smtp::{self, SmtpSettings};
 
 /// Commands the UI can send to an account's sync worker.
 #[derive(Debug, Clone)]
@@ -38,6 +40,18 @@ pub enum SyncCommand {
     MoveThread { message: MessageId, to: SpecialUse },
     /// Fetch and cache a message body.
     FetchBody { message: MessageId },
+    /// Send a composed message and append a copy to Sent.
+    Send {
+        id: u64,
+        message: Box<OutgoingMessage>,
+        delete_draft: Option<DraftRef>,
+    },
+    /// Append a draft to the Drafts folder (replacing `replace` if given).
+    SaveDraft {
+        id: u64,
+        message: Box<OutgoingMessage>,
+        replace: Option<DraftRef>,
+    },
 }
 
 /// Background sync engine. Cloneable handle; the event receiver is returned by
@@ -127,10 +141,26 @@ impl SyncEngine {
             security: account.imap_security,
             username: account.username.clone(),
         };
+        let smtp = SmtpSettings {
+            host: account.smtp_host.clone(),
+            port: account.smtp_port,
+            security: account.smtp_security,
+            username: account.username.clone(),
+        };
         let account_id = account.id;
 
         tokio::spawn(async move {
-            worker(db, account_id, settings, password, command_rx, events, poll_interval).await;
+            worker(
+                db,
+                account_id,
+                settings,
+                smtp,
+                password,
+                command_rx,
+                events,
+                poll_interval,
+            )
+            .await;
         });
         Ok(())
     }
@@ -148,6 +178,7 @@ async fn worker(
     db: Db,
     account: AccountId,
     settings: ImapSettings,
+    smtp: SmtpSettings,
     password: String,
     mut commands: mpsc::UnboundedReceiver<SyncCommand>,
     events: mpsc::UnboundedSender<Event>,
@@ -156,8 +187,17 @@ async fn worker(
     let mut backoff = Duration::from_secs(2);
     loop {
         events.send(Event::SyncStarted { account }).ok();
-        match run_session(&db, account, &settings, &password, &mut commands, &events, poll_interval)
-            .await
+        match run_session(
+            &db,
+            account,
+            &settings,
+            &smtp,
+            &password,
+            &mut commands,
+            &events,
+            poll_interval,
+        )
+        .await
         {
             Ok(()) => {
                 events.send(Event::SyncFinished { account: account }).ok();
@@ -187,6 +227,7 @@ async fn run_session(
     db: &Db,
     account: AccountId,
     settings: &ImapSettings,
+    smtp: &SmtpSettings,
     password: &str,
     commands: &mut mpsc::UnboundedReceiver<SyncCommand>,
     events: &mpsc::UnboundedSender<Event>,
@@ -302,6 +343,31 @@ async fn run_session(
             }
             Some(SyncCommand::FetchBody { message }) => {
                 apply_fetch_body(db, &mut conn, message, events).await?;
+            }
+            Some(SyncCommand::Send {
+                id,
+                message,
+                delete_draft,
+            }) => {
+                send_message(
+                    db,
+                    &mut conn,
+                    smtp,
+                    password,
+                    account,
+                    id,
+                    *message,
+                    delete_draft,
+                    events,
+                )
+                .await;
+            }
+            Some(SyncCommand::SaveDraft {
+                id,
+                message,
+                replace,
+            }) => {
+                save_draft(db, &mut conn, account, id, *message, replace, events).await;
             }
             None => {
                 // Poll timeout or new data: refresh the Inbox.
@@ -660,6 +726,251 @@ async fn apply_fetch_body(
         .send(Event::MessagesChanged { account, folder: folder_id })
         .ok();
     Ok(())
+}
+
+/// Deliver a composed message: resolve forwarded attachments, send via SMTP,
+/// append a copy to Sent, and report the outcome.
+#[allow(clippy::too_many_arguments)]
+async fn send_message(
+    db: &Db,
+    session: &mut ImapSession,
+    smtp_settings: &SmtpSettings,
+    password: &str,
+    account: AccountId,
+    id: u64,
+    mut message: OutgoingMessage,
+    delete_draft: Option<DraftRef>,
+    events: &mpsc::UnboundedSender<Event>,
+) {
+    let message_id = message.message_id.clone();
+    let error = deliver(
+        db,
+        session,
+        smtp_settings,
+        password,
+        account,
+        &mut message,
+        delete_draft,
+        events,
+    )
+    .await
+    .err()
+    .map(|error| error.to_string());
+    events
+        .send(Event::SendResult {
+            id,
+            account,
+            message_id,
+            error,
+        })
+        .ok();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver(
+    db: &Db,
+    session: &mut ImapSession,
+    smtp_settings: &SmtpSettings,
+    password: &str,
+    account: AccountId,
+    message: &mut OutgoingMessage,
+    delete_draft: Option<DraftRef>,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<()> {
+    if let Some(original) = message.forward_of.take() {
+        message
+            .attachments
+            .extend(forward_attachments(db, session, original).await?);
+    }
+
+    let built = message.build_message()?;
+    let raw = built.formatted();
+    smtp::send(smtp_settings, password, built).await?;
+
+    if let Some(draft) = delete_draft {
+        // Best-effort: the message is already sent.
+        let _ = session.delete_message(&draft.folder, draft.uid).await;
+        if let Ok(Some(local)) = db.message_by_message_id(account, &draft.message_id) {
+            let _ = db.delete_message(local.id);
+            events
+                .send(Event::MessagesChanged {
+                    account,
+                    folder: local.folder_id,
+                })
+                .ok();
+        }
+    }
+
+    // Append to Sent; a missing Sent folder shouldn't fail the send.
+    if let Some((path, folder_id)) = special_folder(db, account, SpecialUse::Sent)? {
+        session.append(&path, "(\\Seen)", &raw).await?;
+        let last_uid = db.folder(folder_id)?.map(|f| f.last_uid).unwrap_or(0);
+        sync_folder(db, session, account, folder_id, &path, last_uid).await?;
+        events
+            .send(Event::MessagesChanged {
+                account,
+                folder: folder_id,
+            })
+            .ok();
+    }
+
+    mark_answered(db, session, account, message).await;
+    Ok(())
+}
+
+/// Flag the message a reply answers as `\Answered`, best-effort.
+async fn mark_answered(
+    db: &Db,
+    session: &mut ImapSession,
+    account: AccountId,
+    message: &OutgoingMessage,
+) {
+    if message.in_reply_to.is_empty() {
+        return;
+    }
+    let Ok(Some(parent)) = db.message_by_message_id(account, &message.in_reply_to) else {
+        return;
+    };
+    let mut flags = parent.flags;
+    if flags.answered {
+        return;
+    }
+    flags.answered = true;
+    if let Ok(Some((_, path, _, uid, _))) = db.message_location(parent.id) {
+        if session.set_flags(&path, uid, flags).await.is_ok() {
+            let _ = db.set_flags(parent.id, flags);
+        }
+    }
+}
+
+/// Save a draft to the Drafts folder, replacing `replace` when given.
+async fn save_draft(
+    db: &Db,
+    session: &mut ImapSession,
+    account: AccountId,
+    id: u64,
+    message: OutgoingMessage,
+    replace: Option<DraftRef>,
+    events: &mpsc::UnboundedSender<Event>,
+) {
+    match store_draft(db, session, account, &message, replace, events).await {
+        Ok(draft) => {
+            events
+                .send(Event::DraftSaved {
+                    id,
+                    account,
+                    draft: Some(draft),
+                    error: None,
+                })
+                .ok();
+        }
+        Err(error) => {
+            events
+                .send(Event::DraftSaved {
+                    id,
+                    account,
+                    draft: None,
+                    error: Some(error.to_string()),
+                })
+                .ok();
+        }
+    }
+}
+
+async fn store_draft(
+    db: &Db,
+    session: &mut ImapSession,
+    account: AccountId,
+    message: &OutgoingMessage,
+    replace: Option<DraftRef>,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<DraftRef> {
+    let Some((path, folder_id)) = special_folder(db, account, SpecialUse::Drafts)? else {
+        return Err(Error::Config(
+            "this account has no Drafts folder".to_string(),
+        ));
+    };
+    if let Some(draft) = replace {
+        let _ = session.delete_message(&draft.folder, draft.uid).await;
+        if let Ok(Some(local)) = db.message_by_message_id(account, &draft.message_id) {
+            let _ = db.delete_message(local.id);
+        }
+    }
+    let built = message.build_draft()?;
+    let raw = built.formatted();
+    session.append(&path, "(\\Draft)", &raw).await?;
+    let last_uid = db.folder(folder_id)?.map(|f| f.last_uid).unwrap_or(0);
+    sync_folder(db, session, account, folder_id, &path, last_uid).await?;
+    let found = db
+        .message_by_message_id(account, &message.message_id)?
+        .ok_or_else(|| Error::Protocol("saved draft not found after sync".to_string()))?;
+    events
+        .send(Event::MessagesChanged {
+            account,
+            folder: folder_id,
+        })
+        .ok();
+    Ok(DraftRef {
+        folder: path,
+        uid: found.uid,
+        message_id: message.message_id.clone(),
+    })
+}
+
+/// Re-fetch an original message and turn its MIME parts into attachments.
+async fn forward_attachments(
+    db: &Db,
+    session: &mut ImapSession,
+    original: MessageId,
+) -> Result<Vec<OutgoingAttachment>> {
+    let Some((_, path, _, uid, _)) = db.message_location(original)? else {
+        return Ok(Vec::new());
+    };
+    let Some(raw) = session.fetch_full(&path, uid).await? else {
+        return Ok(Vec::new());
+    };
+    let Some(mail) = mail_parser::MessageParser::default().parse(&raw) else {
+        return Ok(Vec::new());
+    };
+    use mail_parser::MimeHeaders;
+    let attachments = mail
+        .attachments()
+        .map(|part| {
+            let mime = match part.content_type() {
+                Some(content_type) => match content_type.subtype() {
+                    Some(subtype) => format!("{}/{}", content_type.ctype(), subtype),
+                    None => content_type.ctype().to_string(),
+                },
+                None => "application/octet-stream".to_string(),
+            };
+            let content_id = part.content_id().map(str::to_string);
+            let inline = part
+                .content_disposition()
+                .map(|disposition| disposition.is_inline())
+                .unwrap_or(false)
+                || (part.content_disposition().is_none() && content_id.is_some());
+            OutgoingAttachment {
+                filename: part.attachment_name().unwrap_or("attachment").to_string(),
+                mime,
+                data: part.contents().to_vec(),
+                inline: inline && content_id.is_some(),
+                content_id,
+            }
+        })
+        .collect();
+    Ok(attachments)
+}
+
+fn special_folder(
+    db: &Db,
+    account: AccountId,
+    special: SpecialUse,
+) -> Result<Option<(String, crate::folder::FolderId)>> {
+    Ok(db
+        .folders(account)?
+        .into_iter()
+        .find(|folder| folder.special_use == special)
+        .map(|folder| (folder.path, folder.id)))
 }
 
 fn snippet_of(text: &str) -> String {

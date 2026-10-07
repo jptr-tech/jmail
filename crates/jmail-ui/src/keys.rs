@@ -21,8 +21,13 @@ pub fn install(ui: &Ui) {
     controller.connect_key_pressed(move |_, key, _, state| {
         // Never steal keys while the user is typing in a text field.
         if let Some(focus) = gtk::prelude::GtkWindowExt::focus(&window) {
-            if focus.is::<gtk::Editable>() && key != gdk::Key::Escape {
+            let in_editor = focus.is::<gtk::TextView>();
+            if focus.is::<gtk::Editable>() || in_editor {
                 pending_g.set(false);
+                if key == gdk::Key::Escape && in_editor {
+                    activate(&window, "win.discard-reply");
+                    return Propagation::Stop;
+                }
                 return Propagation::Proceed;
             }
         }
@@ -70,7 +75,7 @@ pub fn install(ui: &Ui) {
                 gdk::Key::k | gdk::Key::Up => Some("win.prev-message"),
                 gdk::Key::o | gdk::Key::Return => Some("win.open-window"),
                 gdk::Key::u | gdk::Key::Escape => Some("win.back"),
-                gdk::Key::c => Some("win.compose"),
+                gdk::Key::c if !ctrl => Some("win.compose"),
                 gdk::Key::r => Some("win.reply"),
                 gdk::Key::a => Some("win.reply-all"),
                 gdk::Key::f => Some("win.forward"),

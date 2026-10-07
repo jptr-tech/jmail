@@ -9,12 +9,13 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex, Notify};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::mailbox::{quote, MockMailbox, MockMessage, SeqSet};
+use crate::smtp::MockSmtpServer;
 
 /// TLS material for STARTTLS / implicit TLS on the mock server.
 pub struct MockTls {
@@ -28,6 +29,8 @@ pub struct MockConfig {
     pub password: String,
     /// When `Some`, STARTTLS and implicit TLS are supported.
     pub tls: Option<MockTls>,
+    /// Port for the companion SMTP server (0 picks a free port).
+    pub smtp_port: u16,
 }
 
 impl MockConfig {
@@ -36,11 +39,18 @@ impl MockConfig {
             username: username.to_string(),
             password: password.to_string(),
             tls: None,
+            smtp_port: 0,
         }
     }
 
     pub fn with_tls(mut self) -> Self {
         self.tls = Some(generate_tls());
+        self
+    }
+
+    /// Bind the companion SMTP server to a fixed port (default is OS-assigned).
+    pub fn with_smtp_port(mut self, port: u16) -> Self {
+        self.smtp_port = port;
         self
     }
 }
@@ -61,6 +71,7 @@ pub struct MockServer {
     pub local_addr: SocketAddr,
     pub cert_der: Option<Vec<u8>>,
     shared: Arc<Shared>,
+    smtp: MockSmtpServer,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -76,6 +87,7 @@ impl MockServer {
         let local_addr = listener.local_addr()?;
         let (changed, _) = watch::channel(0);
         let cert_der = config.tls.as_ref().map(|tls| tls.cert_der.clone());
+        let smtp_port = config.smtp_port;
         let shared = Arc::new(Shared {
             username: config.username,
             password: config.password,
@@ -88,16 +100,29 @@ impl MockServer {
 
         tokio::spawn(accept_loop(listener, shared.clone(), shutdown_rx));
 
+        let smtp = MockSmtpServer::start_on(smtp_port).await?;
+
         Ok(Self {
             local_addr,
             cert_der,
             shared,
+            smtp,
             shutdown: Mutex::new(Some(shutdown_tx)),
         })
     }
 
     pub fn addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The address of the companion SMTP server.
+    pub fn smtp_addr(&self) -> SocketAddr {
+        self.smtp.addr()
+    }
+
+    /// Messages captured by the companion SMTP server.
+    pub async fn delivered(&self) -> Vec<Vec<u8>> {
+        self.smtp.delivered().await
     }
 
     /// Inject a message into a folder, waking IDLE sessions. Returns the UID.
@@ -122,6 +147,7 @@ impl MockServer {
         if let Some(sender) = self.shutdown.lock().await.take() {
             sender.send(()).ok();
         }
+        self.smtp.shutdown().await;
     }
 }
 
@@ -369,6 +395,13 @@ async fn handle_connection(socket: TcpStream, shared: Arc<Shared>) -> io::Result
                 }
                 handle_uid(&mut stream, &shared, &mut state, &tag, command).await?;
             }
+            "APPEND" => {
+                if !state.authed {
+                    no(&mut stream, &tag, "not authenticated").await?;
+                    continue;
+                }
+                handle_append(&mut stream, &shared, &tag, command).await?;
+            }
             "EXPUNGE" => {
                 let selected = state.selected.clone().unwrap_or_default();
                 for seq in expunge_deleted(&shared, &selected).await.iter().rev() {
@@ -386,7 +419,7 @@ async fn handle_connection(socket: TcpStream, shared: Arc<Shared>) -> io::Result
                 idle(&mut stream, &shared, &state, &tag).await?;
             }
             "CHECK" | "NAMESPACE" | "CREATE" | "DELETE" | "RENAME" | "SUBSCRIBE"
-            | "UNSUBSCRIBE" | "STATUS" | "APPEND" | "FETCH" | "SEARCH" | "STORE" | "COPY"
+            | "UNSUBSCRIBE" | "STATUS" | "FETCH" | "SEARCH" | "STORE" | "COPY"
             | "MOVE" => {
                 // Accepted but not implemented; the engine only uses UID forms.
                 write(&mut stream, &format!("{tag} OK {name} completed\r\n")).await?;
@@ -494,6 +527,71 @@ async fn handle_uid(
             ok(stream, tag).await
         }
         _ => no(stream, tag, "unknown UID command").await,
+    }
+}
+
+/// Handle `APPEND mailbox [(flags)] {literal}`.
+async fn handle_append(
+    stream: &mut ServerStream,
+    shared: &Arc<Shared>,
+    tag: &str,
+    command: &str,
+) -> io::Result<()> {
+    let Some((before, literal)) = command.rsplit_once('{') else {
+        return no(stream, tag, "APPEND missing literal length").await;
+    };
+    let length: usize = match literal.trim().trim_end_matches('}').parse() {
+        Ok(length) => length,
+        Err(_) => return no(stream, tag, "bad literal length").await,
+    };
+
+    let rest = before.trim_start();
+    let rest = rest
+        .strip_prefix("APPEND")
+        .or_else(|| rest.strip_prefix("append"))
+        .unwrap_or(rest)
+        .trim_start();
+    let (mailbox, after) = if let Some(stripped) = rest.strip_prefix('"') {
+        match stripped.split_once('"') {
+            Some((name, tail)) => (name.to_string(), tail.trim_start()),
+            None => return no(stream, tag, "unterminated mailbox name").await,
+        }
+    } else {
+        let mut parts = rest.splitn(2, ' ');
+        (
+            parts.next().unwrap_or("").to_string(),
+            parts.next().unwrap_or("").trim_start(),
+        )
+    };
+    let flags: Vec<String> = after
+        .split_once('(')
+        .and_then(|(_, tail)| tail.split_once(')'))
+        .map(|(inner, _)| inner.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+
+    write(stream, "+ Ready for literal data\r\n").await?;
+    stream.flush().await?;
+
+    let mut data = vec![0u8; length];
+    stream.read_exact(&mut data).await?;
+    let mut crlf = [0u8; 2];
+    let _ = stream.read_exact(&mut crlf).await;
+
+    let message = MockMessage::from_raw(&data, &flags);
+    let uid = {
+        let mut mailbox_state = shared.mailbox.lock().await;
+        if mailbox_state.folder(&mailbox).is_none() {
+            None
+        } else {
+            Some(mailbox_state.push(&mailbox, message))
+        }
+    };
+    match uid {
+        Some(uid) if uid > 0 => {
+            bump(shared);
+            write(stream, &format!("{tag} OK [APPENDUID 1 {uid}] APPEND completed\r\n")).await
+        }
+        _ => no(stream, tag, "no such mailbox").await,
     }
 }
 

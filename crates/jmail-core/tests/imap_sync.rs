@@ -575,3 +575,338 @@ async fn rebuild_clears_and_refetches_from_server() {
     engine.stop_account(account);
     server.shutdown().await;
 }
+
+/// Insert a generic account wired to the mock's IMAP and SMTP listeners.
+async fn account_with_smtp(server: &MockServer) -> (Db, jmail_core::AccountId) {
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.smtp_host = "127.0.0.1".to_string();
+            account.smtp_port = server.smtp_addr().port();
+            account.smtp_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+    (db, account)
+}
+
+async fn wait_for_sync_finished(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<jmail_core::Event>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("sync finished before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::Event::SyncFinished { .. }) {
+            return;
+        }
+    }
+}
+
+async fn wait_send_result(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<jmail_core::Event>,
+    id: u64,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("send result before deadline")
+            .expect("channel open");
+        if let jmail_core::Event::SendResult { id: got, error, .. } = event {
+            if got == id {
+                return error;
+            }
+        }
+    }
+}
+
+async fn wait_draft_saved(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<jmail_core::Event>,
+    id: u64,
+) -> Option<jmail_core::DraftRef> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("draft saved before deadline")
+            .expect("channel open");
+        if let jmail_core::Event::DraftSaved { id: got, draft, .. } = event {
+            if got == id {
+                return draft;
+            }
+        }
+    }
+}
+
+fn sample_outgoing(subject: &str, markdown: &str) -> jmail_core::OutgoingMessage {
+    jmail_core::OutgoingMessage {
+        message_id: jmail_core::OutgoingMessage::generate_message_id("you@example.com"),
+        from: jmail_core::Address::new("You", "you@example.com"),
+        to: vec![jmail_core::Address::new("Ada", "ada@example.org")],
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        subject: subject.to_string(),
+        markdown: markdown.to_string(),
+        in_reply_to: String::new(),
+        references: Vec::new(),
+        attachments: Vec::new(),
+        forward_of: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_sends_appends_and_forwards_attachments() {
+    let server = start_server(false).await;
+    let (db, account) = account_with_smtp(&server).await;
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+    wait_for_sync_finished(&mut events).await;
+
+    // Forward the quarterly report so its attachment is re-fetched and re-sent.
+    let inbox = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let report = db
+        .messages_in_folder(inbox.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.subject == "Quarterly report")
+        .unwrap();
+
+    let mut message = sample_outgoing("Test send", "# Hello\n\nThis is **bold**.");
+    message.forward_of = Some(report.id);
+
+    engine.send(
+        account,
+        SyncCommand::Send {
+            id: 7,
+            message: Box::new(message.clone()),
+            delete_draft: None,
+        },
+    );
+    let error = wait_send_result(&mut events, 7).await;
+    assert!(error.is_none(), "send failed: {error:?}");
+
+    let delivered = server.delivered().await;
+    assert_eq!(delivered.len(), 1, "one message delivered over SMTP");
+    let raw = String::from_utf8_lossy(&delivered[0]);
+    assert!(raw.contains("Subject: Test send"));
+    assert!(raw.contains("This is bold"), "plain alternative present");
+    assert!(raw.contains("text/html"), "html alternative present");
+    assert!(raw.contains("quarterly-report.pdf"), "forwarded attachment");
+
+    // A copy landed in Sent.
+    let sent = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Sent)
+        .unwrap();
+    assert!(db
+        .messages_in_folder(sent.id, 100)
+        .unwrap()
+        .iter()
+        .any(|stored| stored.message_id == message.message_id));
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_saves_replaces_and_sends_drafts() {
+    let server = start_server(false).await;
+    let (db, account) = account_with_smtp(&server).await;
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+    wait_for_sync_finished(&mut events).await;
+
+    let draft = sample_outgoing("Draft subject", "# Draft\n\nnotes body");
+    engine.send(
+        account,
+        SyncCommand::SaveDraft {
+            id: 11,
+            message: Box::new(draft.clone()),
+            replace: None,
+        },
+    );
+    let first = wait_draft_saved(&mut events, 11).await.expect("draft saved");
+
+    // The draft is cached in Drafts, flagged \Draft, and reopens as markdown.
+    let drafts = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Drafts)
+        .unwrap();
+    let stored = db
+        .messages_in_folder(drafts.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.message_id == draft.message_id)
+        .expect("draft cached");
+    assert!(stored.flags.draft);
+
+    engine.send(
+        account,
+        SyncCommand::FetchBody { message: stored.id },
+    );
+    wait_until(&mut events, Duration::from_secs(10), || {
+        db.message_body(stored.id)
+            .unwrap()
+            .and_then(|body| body.text)
+            .is_some()
+    })
+    .await;
+    let body = db
+        .message_body(stored.id)
+        .unwrap()
+        .and_then(|body| body.text)
+        .unwrap();
+    assert!(body.contains("# Draft"), "draft reopens as markdown: {body:?}");
+
+    // Re-saving replaces the previous draft rather than piling up.
+    let mut revised = draft.clone();
+    revised.markdown = "# Draft v2".to_string();
+    engine.send(
+        account,
+        SyncCommand::SaveDraft {
+            id: 12,
+            message: Box::new(revised.clone()),
+            replace: Some(first.clone()),
+        },
+    );
+    let second = wait_draft_saved(&mut events, 12).await.expect("draft replaced");
+    assert_eq!(second.message_id, draft.message_id);
+
+    // Sending deletes the stored draft and keeps a copy in Sent.
+    engine.send(
+        account,
+        SyncCommand::Send {
+            id: 13,
+            message: Box::new(revised.clone()),
+            delete_draft: Some(second.clone()),
+        },
+    );
+    assert!(wait_send_result(&mut events, 13).await.is_none());
+
+    let mut session = ImapSession::connect(
+        settings(server.addr().port(), Security::None),
+        "hunter2",
+        &TlsTrust::system().unwrap(),
+    )
+    .await
+    .unwrap();
+    let drafts_path = drafts.path.clone();
+    let server_drafts = session.fetch_headers(&drafts_path, 0).await.unwrap();
+    assert!(
+        !server_drafts
+            .iter()
+            .any(|message| message.new.message_id == draft.message_id),
+        "draft removed from the server after sending"
+    );
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_append_lands_in_sent() {
+    let server = start_server(false).await;
+    let mut session = ImapSession::connect(
+        settings(server.addr().port(), Security::None),
+        "hunter2",
+        &TlsTrust::system().unwrap(),
+    )
+    .await
+    .unwrap();
+    let full = session.fetch_full("INBOX", 1).await.unwrap();
+    assert!(full.is_some());
+    session
+        .append(
+            "Sent",
+            "(\\Seen)",
+            b"From: you@example.com\r\nTo: ada@example.org\r\nSubject: direct\r\nMessage-ID: <direct@x>\r\n\r\nhello",
+        )
+        .await
+        .expect("append");
+    let headers = session.fetch_headers("Sent", 0).await.unwrap();
+    assert!(headers.iter().any(|m| m.new.message_id == "direct@x"));
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn syncs_reply_to_header() {
+    let server = start_server(false).await;
+    let mut session = ImapSession::connect(
+        settings(server.addr().port(), Security::None),
+        "hunter2",
+        &TlsTrust::system().unwrap(),
+    )
+    .await
+    .unwrap();
+    let inbox = session
+        .list_folders()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let headers = session.fetch_headers(&inbox.path, 0).await.unwrap();
+    let reply = headers
+        .iter()
+        .find(|message| message.new.subject == "Re: Quarterly report")
+        .expect("reply message");
+    assert_eq!(reply.new.reply_to.len(), 1);
+    assert_eq!(reply.new.reply_to[0].email, "reports@example.org");
+
+    // And it round-trips through the cache.
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    let folder_id = db
+        .upsert_folder(&jmail_core::Folder {
+            id: jmail_core::FolderId(0),
+            account_id: account,
+            name: "Inbox".to_string(),
+            path: inbox.path.clone(),
+            special_use: SpecialUse::Inbox,
+            unread: 0,
+            total: 0,
+            uidvalidity: 1,
+            uidnext: 1,
+            last_uid: 0,
+        })
+        .unwrap();
+    let id = db
+        .upsert_message(&{
+            let mut new = reply.new.clone();
+            new.account_id = account;
+            new.folder_id = folder_id;
+            new
+        })
+        .unwrap();
+    let stored = db.get_message(id).unwrap().unwrap();
+    assert_eq!(stored.reply_to[0].email, "reports@example.org");
+
+    server.shutdown().await;
+}

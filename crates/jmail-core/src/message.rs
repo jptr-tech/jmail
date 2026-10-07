@@ -94,6 +94,8 @@ pub struct Message {
     pub from: Address,
     pub to: Vec<Address>,
     pub cc: Vec<Address>,
+    /// RFC 5322 `Reply-To`, if any.
+    pub reply_to: Vec<Address>,
     pub date: OffsetDateTime,
     pub flags: Flags,
     pub snippet: String,
@@ -124,6 +126,7 @@ pub struct NewMessage {
     pub from: Address,
     pub to: Vec<Address>,
     pub cc: Vec<Address>,
+    pub reply_to: Vec<Address>,
     pub date: OffsetDateTime,
     pub flags: Flags,
     pub snippet: String,

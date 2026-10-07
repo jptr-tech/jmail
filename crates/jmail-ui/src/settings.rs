@@ -5,7 +5,10 @@ use jmail_core::{Account, Security};
 
 /// Open the preferences dialog.
 pub fn present(parent: Option<&impl IsA<gtk::Widget>>) {
-    let dialog = adw::PreferencesDialog::builder().title("Settings").build();
+    let dialog = adw::PreferencesDialog::builder()
+        .title("Settings")
+        .content_height(800)
+        .build();
     dialog.add(&accounts_page());
     dialog.add(&notifications_page());
     dialog.add(&reading_page());
@@ -97,7 +100,7 @@ pub fn shortcuts(parent: Option<&impl IsA<gtk::Widget>>) {
             ("Reply", "r"),
             ("Reply all", "a"),
             ("Forward", "f"),
-            ("Send", "<Control>Return"),
+            ("Send", "<Shift>Return"),
         ],
     ));
     dialog.add(section(
@@ -277,6 +280,11 @@ fn show_add_account_dialog(parent: Option<&gtk::Window>, accounts: AccountsGroup
     let security = gtk::DropDown::from_strings(&["TLS", "STARTTLS", "None"]);
     security.set_selected(0);
 
+    let smtp_host = entry("smtp.example.com");
+    let smtp_port = entry("465");
+    let smtp_security = gtk::DropDown::from_strings(&["TLS", "STARTTLS", "None"]);
+    smtp_security.set_selected(0);
+
     let form = gtk::Box::new(Orientation::Vertical, 8);
     form.set_margin_top(16);
     form.set_margin_bottom(16);
@@ -289,6 +297,10 @@ fn show_add_account_dialog(parent: Option<&gtk::Window>, accounts: AccountsGroup
     form.append(&labeled("Security", &security));
     form.append(&labeled("Username", &username));
     form.append(&labeled("Password", &password));
+    form.append(&gtk::Separator::new(Orientation::Horizontal));
+    form.append(&labeled("SMTP server", &smtp_host));
+    form.append(&labeled("SMTP port", &smtp_port));
+    form.append(&labeled("SMTP security", &smtp_security));
 
     let cancel = gtk::Button::with_label("Cancel");
     let save = gtk::Button::with_label("Add Account");
@@ -337,6 +349,17 @@ fn show_add_account_dialog(parent: Option<&gtk::Window>, accounts: AccountsGroup
             account.imap_host = host.text().to_string();
             account.imap_port = port.text().parse().unwrap_or(993);
             account.imap_security = match security.selected() {
+                1 => Security::StartTls,
+                2 => Security::None,
+                _ => Security::Tls,
+            };
+            account.smtp_host = if smtp_host.text().is_empty() {
+                host.text().to_string()
+            } else {
+                smtp_host.text().to_string()
+            };
+            account.smtp_port = smtp_port.text().parse().unwrap_or(465);
+            account.smtp_security = match smtp_security.selected() {
                 1 => Security::StartTls,
                 2 => Security::None,
                 _ => Security::Tls,

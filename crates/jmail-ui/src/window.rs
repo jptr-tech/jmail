@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -6,7 +7,7 @@ use gtk::gio;
 use gtk::glib::BoxedAnyObject;
 use gtk::{Align, Orientation};
 
-use jmail_core::{AccountId, Db, Event, SpecialUse, SyncEngine};
+use jmail_core::{AccountId, Db, Event, MessageId, SpecialUse, SyncEngine, ThreadFilter};
 
 use crate::context::AppContext;
 use crate::message_row::MessageRow;
@@ -44,6 +45,13 @@ pub struct Ui {
     pub reading_empty: adw::StatusPage,
     pub reading_subject: gtk::Label,
     pub conversation: gtk::Box,
+    /// Holds the reused per-message cells.
+    pub messages_box: gtk::Box,
+    /// Reply / Reply all / Forward buttons below the conversation.
+    pub reply_bar: gtk::Box,
+    /// Holds an inline reply composer, if one is open.
+    pub compose_slot: gtk::Box,
+    pub reading_scroll: gtk::ScrolledWindow,
     /// Long-lived per-message body cells. Each cell's WebView is created once
     /// and reused for later messages so WebKit's compositing surface is never
     /// torn down and re-created.
@@ -51,6 +59,15 @@ pub struct Ui {
     pub search_bar: gtk::SearchBar,
     pub search_entry: gtk::SearchEntry,
     pub search_toggle: gtk::ToggleButton,
+    /// The active folder/conversation filter for the list.
+    pub active_view: Rc<Cell<ThreadFilter>>,
+    /// Result handlers for open compose windows, keyed by correlation id.
+    pub compose_replies: Rc<RefCell<HashMap<u64, Rc<dyn Fn(crate::compose::ComposeOutcome)>>>>,
+    next_compose_id: Rc<Cell<u64>>,
+    /// A draft whose body is still being fetched before compose can open.
+    pub pending_draft: Rc<RefCell<Option<MessageId>>>,
+    /// The correlation id of the open inline composer, if any.
+    pub inline_composer: Rc<Cell<Option<u64>>>,
 }
 
 impl Ui {
@@ -68,7 +85,7 @@ impl Ui {
         let folder_content = gtk::Box::new(Orientation::Vertical, 0);
         folder_content.set_margin_top(6);
         folder_content.set_margin_bottom(6);
-        populate_folders(&folder_content, &db);
+        populate_folders(&folder_content, &db, None);
         let folder_pane = build_folder_pane(&folder_content);
         let reading = build_reading_pane(&status_label);
 
@@ -174,10 +191,19 @@ impl Ui {
             reading_empty: reading.empty,
             reading_subject: reading.subject,
             conversation: reading.conversation,
+            messages_box: reading.messages_box,
+            reply_bar: reading.reply_bar,
+            compose_slot: reading.compose_slot,
+            reading_scroll: reading.scroll,
             cells: Rc::new(RefCell::new(Vec::new())),
             search_bar,
             search_entry,
             search_toggle,
+            active_view: Rc::new(Cell::new(ThreadFilter::Unified)),
+            compose_replies: Rc::new(RefCell::new(HashMap::new())),
+            next_compose_id: Rc::new(Cell::new(0)),
+            pending_draft: Rc::new(RefCell::new(None)),
+            inline_composer: Rc::new(Cell::new(None)),
         };
 
         crate::context::set(AppContext {
@@ -187,6 +213,7 @@ impl Ui {
         });
 
         ui.connect_widgets();
+        ui.reload_folders();
         ui.reload_messages();
         crate::actions::install_window_actions(&ui);
         crate::keys::install(&ui);
@@ -224,12 +251,24 @@ impl Ui {
             Event::MessagesChanged { .. } => {
                 self.reload_messages();
                 crate::actions::reload_preview(self);
+                self.maybe_open_pending_draft();
             }
             Event::SyncStarted { .. } => {
                 self.status_label.set_text("Syncing…");
             }
             Event::SyncFinished { .. } => {
                 self.status_label.set_text("Up to date");
+            }
+            Event::SendResult { id, error, .. } => {
+                self.deliver_compose(id, crate::compose::ComposeOutcome::Send { error });
+            }
+            Event::DraftSaved {
+                id, draft, error, ..
+            } => {
+                self.deliver_compose(
+                    id,
+                    crate::compose::ComposeOutcome::Draft { draft, error },
+                );
             }
             Event::Error { message, .. } => {
                 tracing::warn!(%message, "sync error");
@@ -239,12 +278,83 @@ impl Ui {
         }
     }
 
+    /// Allocate an id for a new compose window.
+    pub fn register_compose(&self) -> u64 {
+        let id = self.next_compose_id.get() + 1;
+        self.next_compose_id.set(id);
+        id
+    }
+
+    /// Attach the result handler for a compose window.
+    pub fn register_compose_handler(
+        &self,
+        id: u64,
+        handler: Rc<dyn Fn(crate::compose::ComposeOutcome)>,
+    ) {
+        self.compose_replies.borrow_mut().insert(id, handler);
+    }
+
+    /// Route a send/draft outcome to the matching compose window.
+    pub fn deliver_compose(&self, id: u64, outcome: crate::compose::ComposeOutcome) {
+        let handler = self.compose_replies.borrow().get(&id).cloned();
+        if let Some(handler) = handler {
+            handler(outcome);
+        }
+    }
+
+    pub fn unregister_compose(&self, id: u64) {
+        self.compose_replies.borrow_mut().remove(&id);
+    }
+
+    /// Remember the correlation id of the open inline composer.
+    pub fn set_inline_composer(&self, id: u64) {
+        self.inline_composer.set(Some(id));
+    }
+
+    /// Remove the inline composer and forget its handler.
+    pub fn clear_inline(&self) {
+        if let Some(id) = self.inline_composer.take() {
+            self.unregister_compose(id);
+        }
+        while let Some(child) = self.compose_slot.first_child() {
+            self.compose_slot.remove(&child);
+        }
+        self.reply_bar.set_visible(true);
+    }
+
+    /// Scroll the reading pane to the bottom (to reveal an inline composer).
+    pub fn scroll_reading_to_bottom(&self) {
+        let scroll = self.reading_scroll.clone();
+        gtk::glib::idle_add_local_once(move || {
+            let adjustment = scroll.vadjustment();
+            adjustment.set_value(adjustment.upper() - adjustment.page_size());
+        });
+    }
+
+    /// Open a draft once its body has been fetched.
+    pub fn maybe_open_pending_draft(&self) {
+        let Some(id) = self.pending_draft.borrow().clone() else {
+            return;
+        };
+        let has_body = self
+            .db
+            .message_body(id)
+            .ok()
+            .flatten()
+            .and_then(|body| body.text)
+            .is_some();
+        if has_body {
+            *self.pending_draft.borrow_mut() = None;
+            crate::compose::present(self, crate::compose::Mode::Draft, Some(id));
+        }
+    }
+
     /// Rebuild the account/folder pane from the cache.
     pub fn reload_folders(&self) {
         while let Some(child) = self.folder_content.first_child() {
             self.folder_content.remove(&child);
         }
-        populate_folders(&self.folder_content, &self.db);
+        populate_folders(&self.folder_content, &self.db, Some(self));
     }
 
     pub fn present(&self) {
@@ -258,7 +368,7 @@ impl Ui {
         let previous_position = self.selection.selected();
 
         self.store.remove_all();
-        match self.db.unified_inbox_threads(500) {
+        match self.db.threads(self.active_view.get(), 500) {
             Ok(threads) => {
                 for thread in &threads {
                     self.store
@@ -399,6 +509,10 @@ struct ReadingPane {
     empty: adw::StatusPage,
     subject: gtk::Label,
     conversation: gtk::Box,
+    messages_box: gtk::Box,
+    reply_bar: gtk::Box,
+    compose_slot: gtk::Box,
+    scroll: gtk::ScrolledWindow,
 }
 
 fn build_header() -> (adw::HeaderBar, gtk::ToggleButton, adw::WindowTitle) {
@@ -460,10 +574,16 @@ fn build_folder_pane(content: &gtk::Box) -> gtk::Widget {
     scrolled.upcast()
 }
 
-/// (Re)build the account and folder rows inside `content`.
-fn populate_folders(content: &gtk::Box, db: &Db) {
+/// (Re)build the account and folder rows inside `content`, wiring clicks to
+/// the folder view when a `Ui` handle is available.
+fn populate_folders(content: &gtk::Box, db: &Db, ui: Option<&Ui>) {
     let joined = folder_list();
-    joined.append(&folder_row("mail-unread-symbolic", "Joined Inbox", None));
+    let joined_row = folder_row("mail-unread-symbolic", "Joined Inbox", None);
+    if let Some(ui) = ui {
+        let ui = ui.clone();
+        joined_row.connect_activated(move |_| set_view(&ui, "Joined Inbox", ThreadFilter::Unified));
+    }
+    joined.append(&joined_row);
     content.append(&joined);
 
     match db.accounts() {
@@ -494,11 +614,20 @@ fn populate_folders(content: &gtk::Box, db: &Db) {
                 let list = folder_list();
                 if let Ok(folders) = db.folders(account.id) {
                     for folder in &folders {
-                        list.append(&folder_row(
+                        let row = folder_row(
                             folder_icon(folder.special_use),
                             &folder.name,
                             None,
-                        ));
+                        );
+                        if let Some(ui) = ui {
+                            let ui = ui.clone();
+                            let id = folder.id;
+                            let name = folder.name.clone();
+                            row.connect_activated(move |_| {
+                                set_view(&ui, &name, ThreadFilter::Folder(id))
+                            });
+                        }
+                        list.append(&row);
                     }
                 }
                 content.append(&list);
@@ -506,6 +635,14 @@ fn populate_folders(content: &gtk::Box, db: &Db) {
         }
         Err(error) => tracing::error!(%error, "failed to load accounts"),
     }
+}
+
+/// Switch the list to a folder view and refresh.
+pub fn set_view(ui: &Ui, label: &str, filter: ThreadFilter) {
+    ui.active_view.set(filter);
+    ui.window_title.set_subtitle(label);
+    ui.reload_messages();
+    ui.status_label.set_text(&format!("Viewing {label}"));
 }
 
 fn folder_list() -> gtk::ListBox {
@@ -683,6 +820,15 @@ fn build_reading_pane(status_label: &gtk::Label) -> ReadingPane {
     let conversation = gtk::Box::new(Orientation::Vertical, 0);
     conversation.set_valign(Align::Start);
 
+    // Message cells go in `messages_box`; an inline reply composer is appended
+    // to `compose_slot` beneath them.
+    let messages_box = gtk::Box::new(Orientation::Vertical, 0);
+    let compose_slot = gtk::Box::new(Orientation::Vertical, 0);
+    let reply_bar = build_reply_bar();
+    conversation.append(&messages_box);
+    conversation.append(&reply_bar);
+    conversation.append(&compose_slot);
+
     let scrolled = gtk::ScrolledWindow::builder()
         .child(&conversation)
         .vexpand(true)
@@ -718,5 +864,43 @@ fn build_reading_pane(status_label: &gtk::Label) -> ReadingPane {
         empty,
         subject,
         conversation,
+        messages_box,
+        reply_bar,
+        compose_slot,
+        scroll: scrolled,
     }
+}
+
+/// The Reply / Reply all / Forward button row shown below the conversation.
+fn build_reply_bar() -> gtk::Box {
+    let bar = gtk::Box::new(Orientation::Horizontal, 8);
+    bar.set_halign(Align::Center);
+    bar.set_margin_top(12);
+    bar.set_margin_bottom(12);
+    bar.set_margin_start(14);
+    bar.set_margin_end(14);
+    bar.add_css_class("reply-bar");
+    // Hidden until a conversation is rendered.
+    bar.set_visible(false);
+    for (icon, label, action) in [
+        ("mail-reply-sender-symbolic", "Reply", "win.reply"),
+        ("mail-reply-all-symbolic", "Reply all", "win.reply-all"),
+        ("mail-forward-symbolic", "Forward", "win.forward"),
+    ] {
+        bar.append(&reply_button(icon, label, action));
+    }
+    bar
+}
+
+fn reply_button(icon: &str, label: &str, action: &str) -> gtk::Button {
+    let content = gtk::Box::new(Orientation::Horizontal, 6);
+    content.append(&gtk::Image::from_icon_name(icon));
+    content.append(&gtk::Label::new(Some(label)));
+    let button = gtk::Button::builder().child(&content).build();
+    button.add_css_class("pill");
+    let action = action.to_string();
+    button.connect_clicked(move |button| {
+        let _ = gtk::prelude::WidgetExt::activate_action(button, &action, None);
+    });
+    button
 }

@@ -6,6 +6,7 @@
 use crate::account::AccountId;
 use crate::folder::FolderId;
 use crate::message::MessageId;
+use crate::outgoing::DraftRef;
 
 /// Something that happened in the background that the UI may want to reflect.
 #[derive(Debug, Clone)]
@@ -24,6 +25,21 @@ pub enum Event {
         account: AccountId,
         folder: FolderId,
         message: MessageId,
+    },
+    /// A composed message was sent (or failed). `id` correlates with the
+    /// `SyncCommand` that requested it.
+    SendResult {
+        id: u64,
+        account: AccountId,
+        message_id: String,
+        error: Option<String>,
+    },
+    /// A draft was saved (or failed), returning where it now lives.
+    DraftSaved {
+        id: u64,
+        account: AccountId,
+        draft: Option<DraftRef>,
+        error: Option<String>,
     },
     /// A recoverable error the UI should surface.
     Error { account: AccountId, message: String },

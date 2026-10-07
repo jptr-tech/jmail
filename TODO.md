@@ -27,7 +27,8 @@ flatpak run tech.jptr.jmail
 # core tests (unit + integration against the mock)
 cargo test -p jmail-core
 
-# dev mock IMAP server (plaintext): then add 127.0.0.1:1143 in Settings
+# dev mock IMAP+SMTP server (plaintext): add 127.0.0.1:1143 as IMAP in Settings
+# and the printed "Mock SMTP listening on 127.0.0.1:<port>" as the SMTP server.
 cargo run -p jmail-mock-imap -- --port 1143 [--tls] [--push-after N]
 
 # regenerate vendored crates after changing dependencies
@@ -82,11 +83,16 @@ Cache: `~/.var/app/tech.jptr.jmail/data/jmail/cache.db`.
 
 > Local `cargo run -p jmail-ui` needs the WebKitGTK dev files: `sudo dnf install webkitgtk6.0-devel javascriptcoregtk6.0-devel libsoup3-devel`. The Flatpak SDK already has them.
 
-## M4 — Sending (SMTP)  ⬜ TODO
-- [ ] SMTP via `lettre` (STARTTLS/implicit TLS; password now, XOAUTH2 after M5).
-- [ ] Wire the compose dialog's Send; reply / reply-all / forward with quoting.
-- [ ] Save sent copy to the Sent folder (`APPEND`), handle drafts (`SyncCommand`/folder).
-- [ ] Address autocomplete (ties into M9 contacts).
+## M4 — Sending (SMTP)  ✅ DONE
+- [x] SMTP via `lettre` (STARTTLS/implicit TLS/plaintext; password now, XOAUTH2 after M5). Sends from the account's sync worker and reports back via `Event::SendResult`.
+- [x] Compose dialog: markdown editor with **live inline styling** (headings/bold/italic/code/quotes/links, syntax markers dimmed) plus a rendered **preview** toggle; From picker, To/Cc/Bcc.
+- [x] Reply / reply-all / forward open **inline at the bottom of the conversation** (Gmail-style); new messages and draft editing use the dialog.
+- [x] Replies target the last message not sent by you, preferring `Reply-To`; reply-all fills Cc with the other original recipients. (`reply_to` column, schema v5.)
+- [x] Reply / reply-all / forward with quoting; forwards re-fetch the original raw message and re-attach its MIME parts.
+- [x] Save sent copy to the Sent folder (`APPEND`); mark the answered original `\Answered`.
+- [x] Full draft lifecycle: Save draft + save-on-close, replace-on-resave, reopen by opening a Drafts message, delete on send.
+- [x] Minimal folder views (`g i/t/d/a` / Inbox/Sent/Drafts/All) so Sent and Drafts are reachable and reopenable.
+- [ ] Address autocomplete (ties into M9 contacts) — deferred.
 
 ## M5 — Google OAuth2 / XOAUTH2  ⬜ TODO  ← likely next
 - [ ] Google Cloud "Desktop app" OAuth client, loopback redirect + PKCE, user-supplied id/secret (stored in keyring).
@@ -99,7 +105,7 @@ Cache: `~/.var/app/tech.jptr.jmail/data/jmail/cache.db`.
 - [x] SPECIAL-USE detection (RFC 6154).
 - [ ] Gmail semantics: archive = remove `\Inbox`, `X-GM-LABELS` for "label as" (`l`).
 - [ ] "Move to folder" picker (`v`) — currently status-only.
-- [ ] Clicking a folder row filters the message list to that folder (currently **Joined Inbox only**); `g i/t/d/a` switch the view, not just the subtitle.
+- [x] Clicking a folder row (or `g i/t/d/a`) filters the message list to that folder / Inbox / Sent / Drafts / All.
 
 ## M7 — Search  🟡 PARTIAL
 - [x] `Db::search` over FTS5 (subject/from/body) + tests.
@@ -126,7 +132,7 @@ Cache: `~/.var/app/tech.jptr.jmail/data/jmail/cache.db`.
 
 ## Cross-cutting known limitations
 - Gmail is unusable until M5 (OAuth); the Add Account dialog is generic IMAP only.
-- Send is a stub (compose opens, Send closes).
+- Send works for password accounts; Gmail sending waits on M5 (OAuth).
 - Search covers only the loaded list; folder rows don't switch the view (Joined Inbox only).
 - Snippets are empty until a body is fetched; initial sync fetches **all** headers per folder (no cap yet).
 - Notifications are configured but never emitted.

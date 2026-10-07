@@ -10,6 +10,8 @@ gtk-rs + libadwaita. Flatpak app id `tech.jptr.jmail`.
 - Gmail-style vim keybindings (`j`/`k`, `o`, `e`, `#`, `s`, …).
 - HTML mail rendered with WebKitGTK 6.0 (page scripts disabled, remote images blocked,
   themed to match the app, auto-sized to content).
+- Compose in **markdown** with live inline styling and a rendered preview; send via
+  SMTP, reply/reply-all/forward, and drafts saved to the server's Drafts folder.
 - Generic IMAP/SMTP with a password; Gmail via OAuth is planned.
 
 ## Requirements
@@ -63,25 +65,30 @@ Useful environment variables:
 
 A mock IMAP server ships in the workspace (`crates/jmail-mock-imap`) with a
 canned mailbox and live IDLE push — perfect for trying the app without a real
-account.
+account. It also runs a companion **SMTP** server that captures anything the app
+sends, so you can exercise compose/reply/drafts locally.
 
-Start it from the repo root (plaintext, default port 1143):
+Start it from the repo root (plaintext, default IMAP port 1143):
 
 ```sh
 cargo run -p jmail-mock-imap
 ```
 
-It listens on port **1143** by default.
+It prints both listeners, e.g. `Mock IMAP listening on 127.0.0.1:1143` and
+`Mock SMTP listening on 127.0.0.1:2525`. The SMTP port is **stable by default
+(2525)** so the account setting survives restarts — use it when adding the
+account (see below).
 
 ### Server options
 
 ```sh
-cargo run -p jmail-mock-imap -- [--port N] [--tls] [--push-after N]
+cargo run -p jmail-mock-imap -- [--port N] [--smtp-port N] [--tls] [--push-after N]
 ```
 
 | Flag            | Meaning                                                                 |
 |-----------------|-------------------------------------------------------------------------|
-| `--port N`      | Listen on port `N` (default `1143`).                                    |
+| `--port N`      | IMAP listen port `N` (default `1143`).                                  |
+| `--smtp-port N` | SMTP listen port `N` (default `2525`; `0` picks a free port).           |
 | `--tls`         | Enable implicit TLS / STARTTLS with a self-signed cert.                 |
 | `--push-after N`| After `N` seconds, inject a new Inbox message to exercise IDLE push.    |
 
@@ -103,6 +110,9 @@ Projects**, with sample messages (including an HTML one) and reply messages.
    | Security      | `None`           |
    | Username      | `you@example.com`|
    | Password      | `hunter2`        |
+   | SMTP server   | `127.0.0.1`      |
+   | SMTP port     | `2525` (the mock's default; change if you passed `--smtp-port`) |
+   | SMTP security | `None`           |
 
 4. Click **Add Account**. The engine connects, syncs folders, and the Joined
    Inbox fills. Select a message to preview it; the body is fetched on demand.
@@ -129,7 +139,7 @@ message you have already opened.
 | `o` / `Enter`      | Open conversation in a new window       |
 | `click`            | Preview in the reading pane             |
 | `c`                | Compose                                 |
-| `r` / `a` / `f`    | Reply / reply all / forward             |
+| `r` / `a` / `f`    | Reply / reply all / forward (inline, at the bottom of the conversation) |
 | `e`                | Archive                                 |
 | `#`                | Delete                                  |
 | `s`                | Star                                    |
