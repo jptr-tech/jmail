@@ -554,6 +554,30 @@ impl Db {
         Ok(())
     }
 
+    /// Drop every cached message for an account (FTS index kept in sync by triggers).
+    pub fn clear_account_messages(&self, account: AccountId) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM messages WHERE account_id = ?1",
+            params![account.0],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Zero per-folder sync bookkeeping so the next sync re-fetches everything.
+    pub fn reset_folder_sync_state(&self, account: AccountId) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE folders
+             SET uidvalidity = 0, uidnext = 0, last_uid = 0, total = 0, unread = 0
+             WHERE account_id = ?1",
+            params![account.0],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
     // ---- Secrets (dev plaintext fallback; real creds live in the keyring) --
 
     pub fn set_secret(&self, key: &str, value: &str) -> Result<()> {

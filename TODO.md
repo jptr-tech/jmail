@@ -63,17 +63,24 @@ Cache: `~/.var/app/tech.jptr.jmail/data/jmail/cache.db`.
 - [x] `jmail-mock-imap` (TLS via rcgen, live push) + integration tests (STARTTLS, sync, move, IDLE push).
 - [x] Add Account dialog, keyring + `JMAIL_DEV_PLAINTEXT`, account removal, DB v2.
 - [x] Actions push star/read/archive/delete to the server.
+- [x] Settings → **Advanced → Force resync** rebuilds the whole cache from the server (`SyncCommand::Rebuild`).
 - [x] Verified end-to-end in the Flatpak sandbox against the mock.
 
 ---
 
 ## M3 — Conversations, real bodies, HTML  🚧 IN PROGRESS
 - [x] Reading pane renders cached **text** bodies; newest at bottom.
+- [x] Fetch bodies **on open**: preview sends `SyncCommand::FetchBody`; pane re-renders on `MessagesChanged` (`actions.rs ensure_body`/`reload_preview`).
+- [x] **WebKitGTK 6.0** HTML rendering (spike): `webkit6` renders `body_html` with page scripts disabled (`enable-javascript-markup=false`), images not auto-loaded, and `script`/`iframe`/`object`/`embed` stripped. Runtime already ships WebKitGTK 6.0; no extra Flatpak module.
+- [x] WebView theming: background/foreground/accent pulled from the active GTK theme and injected as CSS; re-themes live on `AdwStyleManager::dark` change.
+- [x] WebView auto-size: content height measured via `evaluate_javascript` and re-measured on width changes, so the reading pane scrolls as a whole.
 - [ ] Real threading: build `thread_id` from `References`/`In-Reply-To` (+ Gmail `X-GM-THRID`). Currently `thread_id = message_id` (one message per thread).
-- [ ] Fetch bodies **on open**: send `SyncCommand::FetchBody`, then re-render (body fetch exists in the engine but the UI never requests it).
+- [ ] Collapse the list to one row per conversation (message-count badge); update action identity.
 - [ ] Collapse quoted text / show quoted behind an expander.
 - [ ] MIME: attachments metadata, multipart, reply attribution.
-- [ ] **WebKitGTK 6.0** HTML rendering with remote content blocked + "load images" affordance.
+- [ ] Link handling in HTML bodies (open externally instead of navigating the WebView).
+
+> Local `cargo run -p jmail-ui` needs the WebKitGTK dev files: `sudo dnf install webkitgtk6.0-devel javascriptcoregtk6.0-devel libsoup3-devel`. The Flatpak SDK already has them.
 
 ## M4 — Sending (SMTP)  ⬜ TODO
 - [ ] SMTP via `lettre` (STARTTLS/implicit TLS; password now, XOAUTH2 after M5).

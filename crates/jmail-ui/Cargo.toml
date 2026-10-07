@@ -17,3 +17,4 @@ jmail-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+webkit6.workspace = true

@@ -74,6 +74,21 @@ fn main() -> glib::ExitCode {
         });
         ui.present();
         ui.start_all_accounts();
+
+        if std::env::var("JMAIL_AUTOPREVIEW").as_deref() == Ok("1") {
+            let a = ui.clone();
+            glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                if a.selection.n_items() > 0 {
+                    a.selection.set_selected(0);
+                }
+            });
+            let b = ui.clone();
+            glib::timeout_add_local_once(Duration::from_secs(6), move || {
+                if b.selection.n_items() > 1 {
+                    b.selection.set_selected(1);
+                }
+            });
+        }
     });
 
     app.run()

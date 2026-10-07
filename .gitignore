@@ -4,3 +4,4 @@
 /repo
 *.flatpak
 *.flatpakrepo
+.opencode/

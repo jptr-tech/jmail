@@ -13,6 +13,7 @@ pub struct MockMessage {
     pub message_id: String,
     pub date: String,
     pub text: String,
+    pub html: Option<String>,
     pub flags: Vec<String>,
 }
 
@@ -40,8 +41,15 @@ impl MockMessage {
             message_id: message_id.to_string(),
             date: date.to_string(),
             text: text.to_string(),
+            html: None,
             flags: flags.iter().map(|f| f.to_string()).collect(),
         }
+    }
+
+    /// Attach an HTML alternative body (renders as `multipart/alternative`).
+    pub fn with_html(mut self, html: &str) -> Self {
+        self.html = Some(html.to_string());
+        self
     }
 
     /// The message as an RFC 822 byte string.
@@ -57,11 +65,26 @@ impl MockMessage {
             .map(|(name, email)| format!("{name} <{email}>"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
-            "Message-ID: <{}>\r\nDate: {}\r\nSubject: {}\r\nFrom: {}\r\nTo: {}\r\n\
-             Content-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
-            self.message_id, self.date, self.subject, from, to, self.text
-        )
+        let headers = format!(
+            "Message-ID: <{}>\r\nDate: {}\r\nSubject: {}\r\nFrom: {}\r\nTo: {}",
+            self.message_id, self.date, self.subject, from, to
+        );
+        match &self.html {
+            Some(html) => {
+                let boundary = "jmail-mock-boundary";
+                format!(
+                    "{headers}\r\nContent-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n\
+                     --{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n\
+                     --{boundary}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{}\r\n\
+                     --{boundary}--\r\n",
+                    self.text, html
+                )
+            }
+            None => format!(
+                "{headers}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
+                self.text
+            ),
+        }
     }
 
     /// IMAP `ENVELOPE` structure:
@@ -220,7 +243,37 @@ impl MockMailbox {
 
         let me = [("You", "you@example.com")];
         let inbox = [
-            MockMessage::new("Welcome to Jmail", "Ada Lovelace", "ada@example.org", &me, "m1@example.org", "Mon, 05 Oct 2026 08:12:00 +0000", "Hi! This is the first message in the mock inbox.", &[]),
+            MockMessage::new("Welcome to Jmail", "Ada Lovelace", "ada@example.org", &me, "m1@example.org", "Mon, 05 Oct 2026 08:12:00 +0000", "Hi! This is the first message in the mock inbox.", &[])
+                .with_html(r#"<html>
+<body>
+<h1>Welcome to Jmail</h1>
+<p>This is the <b>HTML</b> part, with <i>italics</i>, <u>underline</u> and inline <code>code</code>.</p>
+<h2>Formatting checklist</h2>
+<ul>
+  <li>Bulleted list item</li>
+  <li>Another item with a <a href="https://example.org">link</a></li>
+</ul>
+<ol>
+  <li>First numbered item</li>
+  <li>Second numbered item</li>
+</ol>
+<blockquote>Quoted text should stand apart from the body.</blockquote>
+<table border="1" cellpadding="6" cellspacing="0">
+  <tr><th align="left">Folder</th><th align="left">Messages</th></tr>
+  <tr><td>Inbox</td><td>5</td></tr>
+  <tr><td>Sent</td><td>1</td></tr>
+</table>
+<div style="background:#eef;border-left:4px solid #673AB7;padding:8px;margin-top:8px;">
+  A callout with its own background colour.
+</div>
+<pre>fn main() {
+    println!("Hello from a pre block");
+}</pre>
+<hr>
+<p>Remote image (must not load): <img src="https://example.org/tracker.png" alt="remote"></p>
+<script>alert('this script must be stripped')</script>
+</body>
+</html>"#),
             MockMessage::new("Re: Welcome to Jmail", "Ada Lovelace", "ada@example.org", &me, "m2@example.org", "Mon, 05 Oct 2026 09:30:00 +0000", "Did the conversation view land?", &["\\Seen"]),
             MockMessage::new("Quarterly report", "Grace Hopper", "grace@example.org", &me, "m3@example.org", "Sun, 04 Oct 2026 14:05:00 +0000", "Attached is the quarterly report.", &[]),
             MockMessage::new("Re: Quarterly report", "Grace Hopper", "grace@example.org", &me, "m4@example.org", "Sun, 04 Oct 2026 18:44:00 +0000", "Thanks, reviewed it.", &["\\Seen", "\\Flagged"]),

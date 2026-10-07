@@ -23,6 +23,8 @@ pub enum SyncCommand {
     Shutdown,
     /// Re-list folders and re-sync every folder.
     Resync,
+    /// Drop the account's cached mail and rebuild every folder from the server.
+    Rebuild,
     /// Push new flags to the server and cache.
     SetFlags { message: MessageId, flags: Flags },
     /// Move a message to a special-use folder on the server.
@@ -187,57 +189,11 @@ async fn run_session(
     let mut session = ImapSession::connect(settings.clone(), password, &trust).await?;
     let supports_move = session.supports_move();
 
-    // 1. Folders.
-    let server_folders = session.list_folders().await?;
-    let mut folder_ids: HashMap<String, crate::folder::FolderId> = HashMap::new();
-    let mut inbox_path: Option<String> = None;
-    for server_folder in &server_folders {
-        let folder = crate::folder::Folder {
-            id: crate::folder::FolderId(0),
-            account_id: account,
-            name: server_folder
-                .path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&server_folder.path)
-                .to_string(),
-            path: server_folder.path.clone(),
-            special_use: server_folder.special_use,
-            unread: 0,
-            total: 0,
-            uidvalidity: 0,
-            uidnext: 0,
-            last_uid: 0,
-        };
-        let id = db.upsert_folder(&folder)?;
-        folder_ids.insert(server_folder.path.clone(), id);
-        if server_folder.special_use == SpecialUse::Inbox {
-            inbox_path = Some(server_folder.path.clone());
-        }
-    }
-    events
-        .send(Event::FoldersChanged { account: account })
-        .ok();
-
-    // 2. Initial header sync for every folder.
-    for server_folder in &server_folders {
-        let Some(folder_id) = folder_ids.get(&server_folder.path) else {
-            continue;
-        };
-        sync_folder(db, &mut session, account, *folder_id, &server_folder.path, 0).await?;
-        events
-            .send(Event::MessagesChanged {
-                account,
-                folder: *folder_id,
-            })
-            .ok();
-    }
-    events
-        .send(Event::SyncFinished { account: account })
-        .ok();
+    // 1. Folders + 2. initial header sync for every folder.
+    let (mut folder_ids, mut inbox_path) = sync_all_folders(db, &mut session, account, events).await?;
 
     // 3. Idle loop over the Inbox.
-    let Some(inbox_path) = inbox_path else {
+    let Some(mut inbox_path) = inbox_path.take() else {
         return Err(Error::Protocol("server has no INBOX".into()));
     };
 
@@ -286,21 +242,30 @@ async fn run_session(
 
         match got_command {
             Some(SyncCommand::Shutdown) => return Ok(()),
+            Some(SyncCommand::Rebuild) => {
+                db.clear_account_messages(account)?;
+                db.reset_folder_sync_state(account)?;
+                let (ids, inbox) = sync_all_folders(db, &mut conn, account, events).await?;
+                folder_ids = ids;
+                if let Some(path) = inbox {
+                    inbox_path = path;
+                }
+            }
             Some(SyncCommand::Resync) => {
-                for server_folder in &server_folders {
-                    let Some(folder_id) = folder_ids.get(&server_folder.path) else {
-                        continue;
-                    };
+                let folders: Vec<(String, crate::folder::FolderId)> = folder_ids
+                    .iter()
+                    .map(|(path, id)| (path.clone(), *id))
+                    .collect();
+                for (path, folder_id) in folders {
                     let last_uid = db
-                        .folder(*folder_id)?
+                        .folder(folder_id)?
                         .map(|folder| folder.last_uid)
                         .unwrap_or(0);
-                    sync_folder(db, &mut conn, account, *folder_id, &server_folder.path, last_uid)
-                        .await?;
+                    sync_folder(db, &mut conn, account, folder_id, &path, last_uid).await?;
                     events
                         .send(Event::MessagesChanged {
                             account,
-                            folder: *folder_id,
+                            folder: folder_id,
                         })
                         .ok();
                 }
@@ -326,6 +291,59 @@ async fn run_session(
         }
         session = Some(conn);
     }
+}
+
+/// List folders, upsert them into the cache, and fetch headers for each from
+/// the beginning. Returns the folder id map and the Inbox path.
+async fn sync_all_folders(
+    db: &Db,
+    session: &mut ImapSession,
+    account: AccountId,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<(HashMap<String, crate::folder::FolderId>, Option<String>)> {
+    let server_folders = session.list_folders().await?;
+    let mut folder_ids: HashMap<String, crate::folder::FolderId> = HashMap::new();
+    let mut inbox_path = None;
+    for server_folder in &server_folders {
+        let folder = crate::folder::Folder {
+            id: crate::folder::FolderId(0),
+            account_id: account,
+            name: server_folder
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&server_folder.path)
+                .to_string(),
+            path: server_folder.path.clone(),
+            special_use: server_folder.special_use,
+            unread: 0,
+            total: 0,
+            uidvalidity: 0,
+            uidnext: 0,
+            last_uid: 0,
+        };
+        let id = db.upsert_folder(&folder)?;
+        folder_ids.insert(server_folder.path.clone(), id);
+        if server_folder.special_use == SpecialUse::Inbox {
+            inbox_path = Some(server_folder.path.clone());
+        }
+    }
+    events.send(Event::FoldersChanged { account }).ok();
+
+    for server_folder in &server_folders {
+        let Some(folder_id) = folder_ids.get(&server_folder.path) else {
+            continue;
+        };
+        sync_folder(db, session, account, *folder_id, &server_folder.path, 0).await?;
+        events
+            .send(Event::MessagesChanged {
+                account,
+                folder: *folder_id,
+            })
+            .ok();
+    }
+    events.send(Event::SyncFinished { account }).ok();
+    Ok((folder_ids, inbox_path))
 }
 
 /// Fetch new headers for a folder and write them to the cache.

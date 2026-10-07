@@ -36,9 +36,18 @@ pub struct Ui {
     pub search_query: Rc<RefCell<String>>,
     /// Bumped on every preview so a stale mark-read timer can be ignored.
     pub preview_generation: Rc<Cell<u64>>,
+    /// The message currently shown in the reading pane, for re-rendering.
+    pub preview_row: Rc<RefCell<Option<MessageRow>>>,
+    /// While set, selection changes do not trigger a reading-pane preview.
+    pub suppress_preview: Rc<Cell<bool>>,
     pub reading_stack: gtk::Stack,
     pub reading_subject: gtk::Label,
     pub conversation: gtk::Box,
+    /// Overlay used to preload the next conversation without disturbing the
+    /// currently displayed one.
+    pub preview_overlay: gtk::Overlay,
+    /// The in-flight conversation container mounted on `preview_overlay`.
+    pub pending_preview: Rc<RefCell<Option<gtk::Widget>>>,
     pub search_bar: gtk::SearchBar,
     pub search_entry: gtk::SearchEntry,
     pub search_toggle: gtk::ToggleButton,
@@ -160,9 +169,13 @@ impl Ui {
             search_filter,
             search_query,
             preview_generation,
+            preview_row: Rc::new(RefCell::new(None)),
+            suppress_preview: Rc::new(Cell::new(false)),
             reading_stack: reading.stack,
             reading_subject: reading.subject,
             conversation: reading.conversation,
+            preview_overlay: reading.overlay,
+            pending_preview: Rc::new(RefCell::new(None)),
             search_bar,
             search_entry,
             search_toggle,
@@ -209,7 +222,10 @@ impl Ui {
     pub fn handle_event(&self, event: Event) {
         match event {
             Event::FoldersChanged { .. } => self.reload_folders(),
-            Event::MessagesChanged { .. } => self.reload_messages(),
+            Event::MessagesChanged { .. } => {
+                self.reload_messages();
+                crate::actions::reload_preview(self);
+            }
             Event::SyncStarted { .. } => {
                 self.status_label.set_text("Syncing…");
             }
@@ -257,16 +273,25 @@ impl Ui {
         // back to the same position so a deleted row selects the next one.
         if let Some(id) = previous_id {
             if let Some(position) = self.position_of_message(id) {
-                self.selection.set_selected(position);
+                self.select_quietly(position);
                 return;
             }
         }
         if previous_position != u32::MAX {
             let count = self.selection.n_items();
             if count > 0 {
-                self.selection.set_selected(previous_position.min(count - 1));
+                self.select_quietly(previous_position.min(count - 1));
             }
         }
+    }
+
+    /// Select a row without triggering the reading-pane preview. Used when a
+    /// model rebuild or in-place row update would otherwise fire a redundant
+    /// re-render (and drop the selection).
+    pub(crate) fn select_quietly(&self, position: u32) {
+        self.suppress_preview.set(true);
+        self.selection.set_selected(position);
+        self.suppress_preview.set(false);
     }
 
     fn selected_message_id(&self) -> Option<i64> {
@@ -350,6 +375,13 @@ impl Ui {
                     }
                 });
         }
+        // Re-theme HTML bodies when the desktop switches light/dark.
+        {
+            let ui = self.clone();
+            adw::StyleManager::default().connect_dark_notify(move |_| {
+                crate::actions::reload_preview(&ui);
+            });
+        }
     }
 }
 
@@ -358,6 +390,7 @@ struct ReadingPane {
     stack: gtk::Stack,
     subject: gtk::Label,
     conversation: gtk::Box,
+    overlay: gtk::Overlay,
 }
 
 fn build_header() -> (adw::HeaderBar, gtk::ToggleButton, adw::WindowTitle) {
@@ -621,8 +654,14 @@ fn build_reading_pane(status_label: &gtk::Label) -> ReadingPane {
     let conversation = gtk::Box::new(Orientation::Vertical, 0);
     conversation.set_valign(Align::Start);
 
+    // While a new conversation loads, it is mounted as an overlay child at zero
+    // opacity so it renders off-screen; once ready it is swapped into
+    // `conversation`, keeping the previous message visible until then.
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&conversation));
+
     let scrolled = gtk::ScrolledWindow::builder()
-        .child(&conversation)
+        .child(&overlay)
         .vexpand(true)
         .build();
 
@@ -654,5 +693,6 @@ fn build_reading_pane(status_label: &gtk::Label) -> ReadingPane {
         stack,
         subject,
         conversation,
+        overlay,
     }
 }

@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -200,13 +201,13 @@ fn replace_row(ui: &Ui, row: &MessageRow) {
     ui.store
         .splice(position, 1, &[BoxedAnyObject::new(row.clone())]);
     if filter_position != u32::MAX {
-        ui.selection.set_selected(filter_position);
+        ui.select_quietly(filter_position);
     }
 }
 
 /// Preview the message at `position` in the reading pane (hover / j / k).
 pub(crate) fn request_preview(ui: &Ui, position: u32) {
-    if ui.list_split.is_collapsed() {
+    if ui.suppress_preview.get() || ui.list_split.is_collapsed() {
         return;
     }
     let Some(row) = row_at(ui, position) else {
@@ -236,8 +237,10 @@ fn open_window(ui: &Ui) {
 fn begin_preview(ui: &Ui, row: &MessageRow, show_content: bool) {
     let generation = ui.preview_generation.get().wrapping_add(1);
     ui.preview_generation.set(generation);
+    *ui.preview_row.borrow_mut() = Some(row.clone());
 
     render_preview(ui, row);
+    ensure_body(ui, row);
     if show_content {
         ui.list_split.set_show_content(true);
     }
@@ -255,14 +258,110 @@ fn begin_preview(ui: &Ui, row: &MessageRow, show_content: bool) {
 }
 
 fn render_preview(ui: &Ui, row: &MessageRow) {
+    let theme = html_theme(&ui.conversation);
     ui.reading_subject.set_label(&row.subject);
-    while let Some(child) = ui.conversation.first_child() {
-        ui.conversation.remove(&child);
-    }
-    for widget in conversation_message_widgets(&ui.db, row) {
-        ui.conversation.append(&widget);
-    }
     ui.reading_stack.set_visible_child_name("conversation");
+
+    let generation = ui.preview_generation.get();
+
+    // Drop any conversation still preloading from a previous selection.
+    if let Some(pending) = ui.pending_preview.borrow_mut().take() {
+        ui.preview_overlay.remove_overlay(&pending);
+    }
+
+    // If something is already on screen, build the next conversation off to the
+    // side and only swap it in once it has rendered.
+    let keep_previous = ui.conversation.first_child().is_some();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.set_valign(gtk::Align::Start);
+
+    if !keep_previous {
+        // No previous view: render straight into the visible pane.
+        while let Some(child) = ui.conversation.first_child() {
+            ui.conversation.remove(&child);
+        }
+        for widget in conversation_message_widgets(&ui.db, &theme, None, row) {
+            ui.conversation.append(&widget);
+        }
+        return;
+    }
+
+    content.set_opacity(0.0);
+    ui.preview_overlay.add_overlay(&content);
+    *ui.pending_preview.borrow_mut() = Some(content.clone().upcast());
+
+    let swapped = Rc::new(std::cell::Cell::new(false));
+    let swap: Rc<dyn Fn()> = {
+        let ui = ui.clone();
+        let content = content.clone();
+        let swapped = swapped.clone();
+        Rc::new(move || {
+            if swapped.replace(true) {
+                return;
+            }
+            // A newer preview superseded this one; it will clean us up.
+            if ui.preview_generation.get() != generation {
+                return;
+            }
+            while let Some(child) = ui.conversation.first_child() {
+                ui.conversation.remove(&child);
+            }
+            while let Some(child) = content.first_child() {
+                content.remove(&child);
+                ui.conversation.append(&child);
+            }
+            ui.preview_overlay.remove_overlay(&content);
+            *ui.pending_preview.borrow_mut() = None;
+        })
+    };
+
+    let ready = PreviewReady {
+        remaining: Rc::new(std::cell::Cell::new(0)),
+        notify: swap.clone(),
+    };
+    for widget in conversation_message_widgets(&ui.db, &theme, Some(&ready), row) {
+        content.append(&widget);
+    }
+    // Nothing to wait for (no HTML bodies): swap right away.
+    if ready.remaining.get() == 0 {
+        (ready.notify)();
+    }
+
+    // Backstop: swap even if some view never reports ready.
+    {
+        let swap = swap.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_secs(1), move || swap());
+    }
+}
+
+/// Re-render the reading pane (e.g. after a body finished fetching).
+pub(crate) fn reload_preview(ui: &Ui) {
+    if let Some(row) = ui.preview_row.borrow().clone() {
+        render_preview(ui, &row);
+    }
+}
+
+/// Ask the sync engine for a message body if it is not cached yet.
+fn ensure_body(ui: &Ui, row: &MessageRow) {
+    let cached = ui
+        .db
+        .message_body(MessageId(row.id))
+        .ok()
+        .flatten()
+        .map(|body| body.text.is_some() || body.html.is_some())
+        .unwrap_or(false);
+    if cached {
+        return;
+    }
+    let account = AccountId(row.account_id);
+    if ui.engine.is_running(account) {
+        ui.engine.send(
+            account,
+            SyncCommand::FetchBody {
+                message: MessageId(row.id),
+            },
+        );
+    }
 }
 
 /// Mark a message read, updating the cache, the list row and the server.
@@ -291,6 +390,9 @@ fn mark_read_by_id(ui: &Ui, id: i64) {
 
 /// Apply `update` to the store row with the given message id.
 fn update_row_by_id(ui: &Ui, id: i64, update: impl FnOnce(&mut MessageRow)) {
+    // Replacing a store item drops the selection (object identity changes), so
+    // remember the selected row and restore it once the splice is done.
+    let selected = ui.selection.selected();
     for position in 0..ui.store.n_items() {
         let Some(item) = ui.store.item(position) else {
             continue;
@@ -304,6 +406,9 @@ fn update_row_by_id(ui: &Ui, id: i64, update: impl FnOnce(&mut MessageRow)) {
         let mut row = boxed.borrow::<MessageRow>().clone();
         update(&mut row);
         ui.store.splice(position, 1, &[BoxedAnyObject::new(row)]);
+        if selected != u32::MAX {
+            ui.select_quietly(selected);
+        }
         break;
     }
 }
@@ -424,7 +529,8 @@ fn open_message_window(ui: &Ui, row: &MessageRow) {
 
     let conversation = gtk::Box::new(gtk::Orientation::Vertical, 0);
     conversation.set_valign(gtk::Align::Start);
-    for widget in conversation_message_widgets(&ui.db, row) {
+    let theme = html_theme(&ui.window);
+    for widget in conversation_message_widgets(&ui.db, &theme, None, row) {
         conversation.append(&widget);
     }
     let scrolled = gtk::ScrolledWindow::builder()
@@ -462,8 +568,71 @@ fn open_message_window(ui: &Ui, row: &MessageRow) {
     mark_read_by_id(ui, row.id);
 }
 
+/// Palette injected into HTML bodies so they match the active GTK theme.
+struct HtmlTheme {
+    bg: gtk::gdk::RGBA,
+    fg: String,
+    accent: String,
+    dark: bool,
+}
+
+/// Read the current theme colours from a themed widget in the reading pane.
+#[allow(deprecated)]
+fn html_theme(widget: &impl IsA<gtk::Widget>) -> HtmlTheme {
+    let style = widget.style_context();
+    let fg_rgba = style
+        .lookup_color("window_fg_color")
+        .unwrap_or_else(|| widget.color());
+    let bg_rgba = style
+        .lookup_color("window_bg_color")
+        .unwrap_or(gtk::gdk::RGBA::WHITE);
+    let accent_rgba = style.lookup_color("accent_color").unwrap_or(fg_rgba);
+    HtmlTheme {
+        bg: bg_rgba,
+        fg: rgba_hex(&fg_rgba),
+        accent: rgba_hex(&accent_rgba),
+        dark: adw::StyleManager::default().is_dark(),
+    }
+}
+
+fn rgba_hex(color: &gtk::gdk::RGBA) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (color.red() * 255.0).round() as u8,
+        (color.green() * 255.0).round() as u8,
+        (color.blue() * 255.0).round() as u8
+    )
+}
+
+/// Tracks how many WebViews in a conversation still need to render before the
+/// preloaded conversation can be swapped in.
+#[derive(Clone)]
+struct PreviewReady {
+    remaining: Rc<std::cell::Cell<usize>>,
+    notify: Rc<dyn Fn()>,
+}
+
+impl PreviewReady {
+    fn start(&self) {
+        self.remaining.set(self.remaining.get() + 1);
+    }
+
+    fn finish(&self) {
+        let remaining = self.remaining.get().saturating_sub(1);
+        self.remaining.set(remaining);
+        if remaining == 0 {
+            (self.notify)();
+        }
+    }
+}
+
 /// Build the message widgets for a conversation, oldest first.
-fn conversation_message_widgets(db: &Db, row: &MessageRow) -> Vec<gtk::Widget> {
+fn conversation_message_widgets(
+    db: &Db,
+    theme: &HtmlTheme,
+    ready: Option<&PreviewReady>,
+    row: &MessageRow,
+) -> Vec<gtk::Widget> {
     let messages = db
         .thread_messages(AccountId(row.account_id), &row.thread_id, 50)
         .unwrap_or_default();
@@ -472,27 +641,42 @@ fn conversation_message_widgets(db: &Db, row: &MessageRow) -> Vec<gtk::Widget> {
             &row.sender,
             &row.date_label,
             &row.snippet,
+            None,
+            theme,
+            ready,
         )];
     }
     messages
         .iter()
         .map(|message| {
-            let body = db
-                .message_body(message.id)
-                .ok()
-                .flatten()
-                .and_then(|body| body.text)
-                .unwrap_or_else(|| message.snippet.clone());
+            let body = db.message_body(message.id).ok().flatten();
+            let (text, html) = match body {
+                Some(body) => (
+                    body.text.unwrap_or_else(|| message.snippet.clone()),
+                    body.html,
+                ),
+                None => (message.snippet.clone(), None),
+            };
             conversation_message(
                 message.from.display(),
                 &format_timestamp(message.date.unix_timestamp()),
-                &body,
+                &text,
+                html.as_deref(),
+                theme,
+                ready,
             )
         })
         .collect()
 }
 
-fn conversation_message(sender: &str, date: &str, body: &str) -> gtk::Widget {
+fn conversation_message(
+    sender: &str,
+    date: &str,
+    body: &str,
+    html: Option<&str>,
+    theme: &HtmlTheme,
+    ready: Option<&PreviewReady>,
+) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
     root.set_margin_top(10);
     root.set_margin_bottom(10);
@@ -513,12 +697,190 @@ fn conversation_message(sender: &str, date: &str, body: &str) -> gtk::Widget {
     head.append(&spacer);
     head.append(&when);
 
-    let text = gtk::Label::new(Some(body));
-    text.set_xalign(0.0);
-    text.set_wrap(true);
-    text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-
     root.append(&head);
-    root.append(&text);
+    match html {
+        Some(html) => {
+            if let Some(ready) = ready {
+                ready.start();
+            }
+            root.append(&html_body(html, theme, ready.cloned()));
+        }
+        None => {
+            let text = gtk::Label::new(Some(body));
+            text.set_xalign(0.0);
+            text.set_wrap(true);
+            text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            root.append(&text);
+        }
+    }
     root.upcast()
+}
+
+/// Render an HTML body in a locked-down, theme-matched `WebKitWebView` that
+/// sizes itself to its content so the reading pane scrolls as a whole.
+fn html_body(html: &str, theme: &HtmlTheme, ready: Option<PreviewReady>) -> gtk::Widget {
+    use webkit6::prelude::*;
+
+    let view = webkit6::WebView::new();
+    if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
+        // JS must be enabled for `evaluate_javascript` (used to auto-size), but
+        // disabling "markup" stops the page's own scripts from running.
+        settings.set_enable_javascript(true);
+        settings.set_enable_javascript_markup(false);
+        settings.set_enable_developer_extras(false);
+        settings.set_auto_load_images(false);
+    }
+    view.set_background_color(&theme.bg);
+    view.set_hexpand(true);
+    view.set_vexpand(false);
+    view.set_size_request(-1, 140);
+    // Keep the view invisible until it has actually rendered, so the pane never
+    // shows WebKit's uninitialised (black) compositing surface.
+    view.set_opacity(0.0);
+
+    let finish: Rc<dyn Fn()> = {
+        let view = view.clone();
+        let ready = ready.clone();
+        let done = Rc::new(std::cell::Cell::new(false));
+        Rc::new(move || {
+            if done.replace(true) {
+                return;
+            }
+            view.set_opacity(1.0);
+            if let Some(ready) = &ready {
+                ready.finish();
+            }
+        })
+    };
+
+    {
+        let finish = finish.clone();
+        view.connect_load_failed(move |_, _, _, _| {
+            finish();
+            false
+        });
+    }
+    view.load_html(&themed_html(html, theme), None);
+
+    {
+        let finish = finish.clone();
+        view.connect_load_changed(move |view, event| {
+            if event == webkit6::LoadEvent::Finished {
+                measure_view_height(view);
+                // `Finished` only means the load completed; wait until the page
+                // can be rasterized (snapshot succeeds) before revealing.
+                let finish = finish.clone();
+                view.snapshot(
+                    webkit6::SnapshotRegion::Visible,
+                    webkit6::SnapshotOptions::NONE,
+                    None::<&gtk::gio::Cancellable>,
+                    move |_result| finish(),
+                );
+            }
+        });
+    }
+    // Backstop so a view that never reports ready still appears.
+    {
+        let finish = finish.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_secs(1), move || finish());
+    }
+    // Re-measure whenever the allocated width changes (the pane was resized).
+    let last_width = std::rc::Rc::new(std::cell::Cell::new(0));
+    view.add_tick_callback(move |view, _clock| {
+        let width = view.width();
+        if width != last_width.get() {
+            last_width.set(width);
+            measure_view_height(view);
+        }
+        gtk::glib::ControlFlow::Continue
+    });
+    view.upcast()
+}
+
+fn measure_view_height(view: &webkit6::WebView) {
+    use webkit6::prelude::*;
+
+    let target = view.clone();
+    view.evaluate_javascript(
+        "Math.ceil(Math.max(document.body.scrollHeight, document.documentElement.scrollHeight))",
+        None,
+        None,
+        None::<&gtk::gio::Cancellable>,
+        move |result| match result {
+            Ok(value) => {
+                let height = value.to_double();
+                if height > 0.0 {
+                    target.set_size_request(-1, height.ceil() as i32 + 2);
+                }
+            }
+            Err(error) => tracing::debug!(%error, "could not measure HTML body height"),
+        },
+    );
+}
+
+/// Wrap sanitized HTML with a stylesheet that matches the active theme.
+fn themed_html(html: &str, theme: &HtmlTheme) -> String {
+    const STYLE: &str = r#"<style>
+:root { color-scheme: __SCHEME__; }
+html, body { background-color: __BG__; color: __FG__; margin: 0; padding: 8px 10px; overflow: hidden; font-family: system-ui, "Adwaita Sans", sans-serif; }
+a { color: __ACCENT__; }
+img { max-width: 100%; height: auto; }
+pre, code { font-family: monospace; }
+pre { background: rgba(127,127,127,0.12); padding: 8px; border-radius: 4px; overflow-x: auto; }
+blockquote { border-left: 3px solid __ACCENT__; margin: 0; padding-left: 10px; opacity: 0.85; }
+table { border-collapse: collapse; max-width: 100%; }
+th, td { border: 1px solid rgba(127,127,127,0.4); padding: 4px 8px; }
+</style>"#;
+    let scheme = if theme.dark { "dark" } else { "light" };
+    let style = STYLE
+        .replace("__SCHEME__", scheme)
+        .replace("__BG__", &rgba_hex(&theme.bg))
+        .replace("__FG__", &theme.fg)
+        .replace("__ACCENT__", &theme.accent);
+    format!("{style}{}", sanitize_html(html))
+}
+
+/// Remove active/remote content (`script`, `iframe`, `object`, `embed`) from an
+/// HTML body before handing it to WebKit. JavaScript is also disabled.
+fn sanitize_html(input: &str) -> String {
+    const BLOCKED: [&str; 4] = ["script", "iframe", "object", "embed"];
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let Some(rel) = lower[cursor..].find('<') else {
+            out.push_str(&input[cursor..]);
+            break;
+        };
+        let start = cursor + rel;
+        out.push_str(&input[cursor..start]);
+        let name = tag_name(&lower[start..]);
+        if let Some(name) = name.filter(|name| BLOCKED.contains(&name.as_str())) {
+            let close = format!("</{name}");
+            let end = lower[start..]
+                .find(&close)
+                .and_then(|rel| input[start + rel..].find('>').map(|gt| start + rel + gt + 1))
+                .or_else(|| input[start..].find('>').map(|gt| start + gt + 1))
+                .unwrap_or(input.len());
+            cursor = end;
+            continue;
+        }
+        let end = input[start..]
+            .find('>')
+            .map(|gt| start + gt + 1)
+            .unwrap_or(input.len());
+        out.push_str(&input[start..end]);
+        cursor = end;
+    }
+    out
+}
+
+fn tag_name(from_lt: &str) -> Option<String> {
+    let rest = from_lt.strip_prefix('<')?;
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
 }

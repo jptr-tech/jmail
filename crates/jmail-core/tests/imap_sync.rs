@@ -97,6 +97,45 @@ async fn syncs_headers_and_flags() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parses_html_alternative_body() {
+    let server = start_server(false).await;
+
+    let mut session = ImapSession::connect(
+        settings(server.addr().port(), Security::None),
+        "hunter2",
+        &TlsTrust::system().unwrap(),
+    )
+    .await
+    .unwrap();
+    let folders = session.list_folders().await.unwrap();
+    let inbox = folders
+        .iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let headers = session.fetch_headers(&inbox.path, 0).await.unwrap();
+    let welcome = headers
+        .iter()
+        .find(|message| message.new.subject == "Welcome to Jmail")
+        .unwrap();
+
+    let raw = session
+        .fetch_full(&inbox.path, welcome.uid)
+        .await
+        .unwrap()
+        .expect("body");
+    let parsed = mail_parser::MessageParser::default()
+        .parse(&raw)
+        .expect("parse");
+    assert!(parsed
+        .body_html(0)
+        .is_some_and(|html| html.contains("Welcome to Jmail")));
+    assert!(parsed
+        .body_text(0)
+        .is_some_and(|text| text.contains("first message")));
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_syncs_into_cache_and_applies_moves() {
     let server = start_server(false).await;
     let db = Db::open_in_memory().unwrap();
@@ -240,6 +279,72 @@ async fn engine_receives_idle_push() {
     let messages = db.messages_in_folder(inbox.id, 100).unwrap();
     assert_eq!(messages.len(), 6);
     assert!(messages.iter().any(|message| message.subject.contains("Pushed while idling")));
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_clears_and_refetches_from_server() {
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let inbox = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let before = db.messages_in_folder(inbox.id, 100).unwrap();
+    assert_eq!(before.len(), 5);
+    let sample_id = before[0].id;
+    let sample_uid = before[0].uid;
+
+    engine.send(account, SyncCommand::Rebuild);
+
+    // After a rebuild the rows are deleted and re-inserted, so the cached row
+    // id for the same server UID must change.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = db.messages_in_folder(inbox.id, 100).unwrap();
+        if now
+            .iter()
+            .any(|message| message.uid == sample_uid && message.id != sample_id)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rebuild did not re-fetch messages"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(db.messages_in_folder(inbox.id, 100).unwrap().len(), 5);
 
     engine.stop_account(account);
     server.shutdown().await;

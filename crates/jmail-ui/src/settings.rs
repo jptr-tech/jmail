@@ -10,7 +10,59 @@ pub fn present(parent: Option<&impl IsA<gtk::Widget>>) {
     dialog.add(&notifications_page());
     dialog.add(&reading_page());
     dialog.add(&sync_page());
+    dialog.add(&advanced_page());
     dialog.present(parent);
+}
+
+fn advanced_page() -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Advanced")
+        .icon_name("preferences-other-symbolic")
+        .build();
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Cache")
+        .description("Rebuild the local mail cache from the server.")
+        .build();
+
+    let resync = adw::ActionRow::builder()
+        .title("Force resync")
+        .subtitle("Delete cached mail and re-fetch every folder for all accounts")
+        .build();
+    let button = gtk::Button::with_label("Resync");
+    button.set_valign(gtk::Align::Center);
+    button.add_css_class("destructive-action");
+    button.connect_clicked(|_| force_resync());
+    resync.add_suffix(&button);
+    group.add(&resync);
+
+    page.add(&group);
+    page
+}
+
+/// Drop the cached mail for every account and rebuild from the server.
+fn force_resync() {
+    let Some(context) = crate::context::get() else {
+        return;
+    };
+    let accounts = context.db.accounts().unwrap_or_default();
+    for account in accounts {
+        let id = account.id;
+        if context.engine.is_running(id) {
+            context.engine.send(id, jmail_core::SyncCommand::Rebuild);
+        } else {
+            if let Err(error) = context.db.clear_account_messages(id) {
+                tracing::error!(%error, "could not clear cached mail");
+            }
+            if let Err(error) = context.db.reset_folder_sync_state(id) {
+                tracing::error!(%error, "could not reset folder sync state");
+            }
+            let engine = context.engine.clone();
+            context.runtime.spawn(async move {
+                let _ = engine.start_account(id).await;
+            });
+        }
+    }
 }
 
 /// Show the About dialog.
