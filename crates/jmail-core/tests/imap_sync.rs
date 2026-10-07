@@ -175,6 +175,33 @@ async fn engine_syncs_into_cache_and_applies_moves() {
     let messages = db.messages_in_folder(inbox.id, 100).unwrap();
     assert_eq!(messages.len(), 5);
 
+    // Replies reconstruct their conversation from References/In-Reply-To: the
+    // demo pairs m1<-m2 and m3<-m4.
+    let welcome = messages
+        .iter()
+        .find(|m| m.subject == "Welcome to Jmail")
+        .unwrap();
+    let welcome_reply = messages
+        .iter()
+        .find(|m| m.subject == "Re: Welcome to Jmail")
+        .unwrap();
+    assert!(!welcome.thread_id.is_empty());
+    assert_eq!(welcome.thread_id, welcome_reply.thread_id);
+    let report = messages
+        .iter()
+        .find(|m| m.subject == "Quarterly report")
+        .unwrap();
+    assert_ne!(welcome.thread_id, report.thread_id);
+    // The Sent reply belongs to the same conversation (across folders).
+    let sent = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.special_use == SpecialUse::Sent)
+        .unwrap();
+    let sent_message = db.messages_in_folder(sent.id, 10).unwrap().remove(0);
+    assert_eq!(sent_message.thread_id, welcome.thread_id);
+
     // Move one to Trash via the engine; the cache reflects it.
     let message = messages[0].id;
     engine
@@ -200,6 +227,205 @@ async fn engine_syncs_into_cache_and_applies_moves() {
         .find(|folder| folder.special_use == SpecialUse::Trash)
         .unwrap();
     assert_eq!(db.messages_in_folder(trash.id, 100).unwrap().len(), 1);
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_applies_thread_wide_flags() {
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let inbox = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let welcome = db
+        .messages_in_folder(inbox.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.subject == "Welcome to Jmail")
+        .unwrap();
+    let other = db
+        .messages_in_folder(inbox.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.subject == "Re: Welcome to Jmail")
+        .unwrap();
+    assert_eq!(welcome.thread_id, other.thread_id);
+    assert!(!welcome.flags.flagged);
+
+    engine.send(
+        account,
+        SyncCommand::SetThreadFlagged {
+            message: welcome.id,
+            flagged: true,
+        },
+    );
+    wait_until(&mut events, Duration::from_secs(10), || {
+        [&welcome.id, &other.id].iter().all(|id| {
+            db.get_message(**id)
+                .unwrap()
+                .is_some_and(|m| m.flags.flagged)
+        })
+    })
+    .await;
+    // The server sees the change too.
+    let refetched = {
+        let mut session = ImapSession::connect(
+            settings(server.addr().port(), Security::None),
+            "hunter2",
+            &TlsTrust::system().unwrap(),
+        )
+        .await
+        .unwrap();
+        session.fetch_headers(&inbox.path, 0).await.unwrap()
+    };
+    assert!(refetched
+        .iter()
+        .filter(|m| m.new.subject.contains("Welcome to Jmail"))
+        .all(|m| m.flags.flagged));
+
+    engine.send(
+        account,
+        SyncCommand::SetThreadSeen {
+            message: welcome.id,
+            seen: true,
+        },
+    );
+    wait_until(&mut events, Duration::from_secs(10), || {
+        [&welcome.id, &other.id].iter().all(|id| {
+            db.get_message(**id)
+                .unwrap()
+                .is_some_and(|m| m.flags.seen)
+        })
+    })
+    .await;
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+/// Poll a condition, draining sync events until it holds or the deadline
+/// passes.
+async fn wait_until(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<jmail_core::events::Event>,
+    timeout: Duration,
+    condition: impl Fn() -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !condition() {
+        let _ = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("condition before deadline");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_extracts_attachment_metadata() {
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let inbox = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let report = db
+        .messages_in_folder(inbox.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.subject == "Quarterly report")
+        .unwrap();
+    assert!(!report.has_attachments, "attachments are only known after the body fetch");
+
+    engine.send(
+        account,
+        SyncCommand::FetchBody {
+            message: report.id,
+        },
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let attachments = loop {
+        let fetched = db.attachments(report.id).unwrap();
+        if !fetched.is_empty() {
+            break fetched;
+        }
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::MessagesChanged { .. }) {
+            continue;
+        }
+    };
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].filename, "quarterly-report.pdf");
+    assert_eq!(attachments[0].mime, "application/pdf");
+    assert!(!attachments[0].inline);
+    assert!(attachments[0].size > 0);
+    assert!(db.get_message(report.id).unwrap().unwrap().has_attachments);
+    // The text part inside the multipart/mixed body is still extracted.
+    let body = db.message_body(report.id).unwrap().unwrap();
+    assert!(body
+        .text
+        .as_deref()
+        .unwrap_or("")
+        .contains("Attached is the quarterly report."));
 
     engine.stop_account(account);
     server.shutdown().await;

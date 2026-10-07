@@ -15,9 +15,9 @@ pub mod sync;
 pub mod threading;
 
 pub use account::{Account, AccountId, AuthKind, Provider, Security};
-pub use cache::Db;
+pub use cache::{Db, ThreadSummary};
 pub use error::{Error, Result};
 pub use events::Event;
 pub use folder::{Folder, FolderId, SpecialUse};
-pub use message::{Address, Flags, Message, MessageBody, MessageId, NewMessage};
+pub use message::{Address, Attachment, Flags, Message, MessageBody, MessageId, NewMessage};
 pub use sync::{SyncCommand, SyncEngine};

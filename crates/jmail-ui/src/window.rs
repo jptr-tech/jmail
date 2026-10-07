@@ -254,24 +254,25 @@ impl Ui {
     /// Reload the message list from the cache (unified inbox, newest first),
     /// preserving the selection where possible.
     pub fn reload_messages(&self) {
-        let previous_id = self.selected_message_id();
+        let previous_thread = self.selected_thread_id();
         let previous_position = self.selection.selected();
 
         self.store.remove_all();
-        match self.db.unified_inbox(500) {
-            Ok(messages) => {
-                for message in &messages {
+        match self.db.unified_inbox_threads(500) {
+            Ok(threads) => {
+                for thread in &threads {
                     self.store
-                        .append(&BoxedAnyObject::new(MessageRow::from_message(message)));
+                        .append(&BoxedAnyObject::new(MessageRow::from_thread(thread)));
                 }
             }
             Err(error) => tracing::error!(%error, "failed to load messages"),
         }
 
-        // Keep the same message selected if it is still present; otherwise fall
-        // back to the same position so a deleted row selects the next one.
-        if let Some(id) = previous_id {
-            if let Some(position) = self.position_of_message(id) {
+        // Keep the same conversation selected if it is still present (its
+        // representative message may have changed); otherwise fall back to the
+        // same position so a removed conversation selects the next one.
+        if let Some(thread) = previous_thread {
+            if let Some(position) = self.position_of_thread(&thread) {
                 self.select_quietly(position);
                 return;
             }
@@ -293,14 +294,14 @@ impl Ui {
         self.suppress_preview.set(false);
     }
 
-    fn selected_message_id(&self) -> Option<i64> {
+    fn selected_thread_id(&self) -> Option<String> {
         let item = self.selection.selected_item()?;
         let boxed = item.downcast::<BoxedAnyObject>().ok()?;
-        let id = boxed.borrow::<MessageRow>().id;
-        Some(id)
+        let thread_id = boxed.borrow::<MessageRow>().thread_id.clone();
+        Some(thread_id)
     }
 
-    fn position_of_message(&self, id: i64) -> Option<u32> {
+    fn position_of_thread(&self, thread_id: &str) -> Option<u32> {
         for position in 0..self.selection.n_items() {
             let Some(item) = self.selection.item(position) else {
                 continue;
@@ -308,7 +309,7 @@ impl Ui {
             let Ok(boxed) = item.downcast::<BoxedAnyObject>() else {
                 continue;
             };
-            if boxed.borrow::<MessageRow>().id == id {
+            if boxed.borrow::<MessageRow>().thread_id == thread_id {
                 return Some(position);
             }
         }
@@ -601,6 +602,12 @@ fn build_message_row() -> gtk::Widget {
     star.set_visible(false);
     row.append(&star);
 
+    let count = gtk::Label::new(None);
+    count.add_css_class("msg-count");
+    count.set_valign(Align::Center);
+    count.set_visible(false);
+    row.append(&count);
+
     let date = gtk::Label::new(None);
     date.add_css_class("msg-date");
     date.add_css_class("dim-label");
@@ -625,6 +632,16 @@ fn bind_message_row(widget: &gtk::Widget, row: &MessageRow) {
     }
     if let Some(star) = crate::util::find_by_css(widget, "msg-star") {
         star.set_visible(row.starred);
+    }
+    if let Some(count) = crate::util::find_by_css(widget, "msg-count")
+        .and_then(|widget| widget.downcast::<gtk::Label>().ok())
+    {
+        if row.message_count > 1 {
+            count.set_text(&row.message_count.to_string());
+            count.set_visible(true);
+        } else {
+            count.set_visible(false);
+        }
     }
     if row.unread {
         widget.add_css_class("unread");

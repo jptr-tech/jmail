@@ -269,7 +269,7 @@ impl ImapSession {
         let range = format!("{}:*", since_uid + 1);
         let stream = self
             .session
-            .uid_fetch(range, "(UID FLAGS ENVELOPE)")
+            .uid_fetch(range, "(UID FLAGS ENVELOPE BODY.PEEK[HEADER])")
             .await
             .map_err(protocol)?;
         let mut messages = Vec::new();
@@ -460,7 +460,24 @@ fn server_message_from(fetch: Fetch) -> Option<ServerMessage> {
         .map(|date| String::from_utf8_lossy(date).to_string());
     let date = parse_date(date.as_deref());
 
-    let mut new = NewMessage {
+    // `References` is not part of the IMAP envelope, so it comes from the raw
+    // header; `In-Reply-To` prefers the header too (the envelope copy is the
+    // fallback when the server truncates the header fetch).
+    let (header_in_reply_to, references) = fetch
+        .header()
+        .map(parse_threading_headers)
+        .unwrap_or_default();
+    let in_reply_to = if header_in_reply_to.is_empty() {
+        envelope
+            .in_reply_to
+            .as_ref()
+            .map(|id| String::from_utf8_lossy(id).to_string())
+            .unwrap_or_default()
+    } else {
+        header_in_reply_to
+    };
+
+    let new = NewMessage {
         account_id: AccountId(0),
         folder_id: FolderId(0),
         uid,
@@ -470,6 +487,8 @@ fn server_message_from(fetch: Fetch) -> Option<ServerMessage> {
             .map(|id| String::from_utf8_lossy(id).to_string())
             .unwrap_or_default(),
         thread_id: String::new(),
+        in_reply_to,
+        references,
         subject: envelope
             .subject
             .as_ref()
@@ -490,12 +509,69 @@ fn server_message_from(fetch: Fetch) -> Option<ServerMessage> {
         body_text: None,
         body_html: None,
     };
-    new.thread_id = new.message_id.clone();
+    // `thread_id` is assigned locally once the message is cached (see
+    // `threading::assign_threads`), so it is left empty here.
     Some(ServerMessage {
         uid,
         flags: new.flags,
         new,
     })
+}
+
+/// Extract `(in_reply_to, references)` from a raw RFC 5322 header block.
+fn parse_threading_headers(header: &[u8]) -> (String, Vec<String>) {
+    let text = String::from_utf8_lossy(header);
+    let mut in_reply_to = String::new();
+    let mut references = Vec::new();
+    let mut current: Option<&'static str> = None;
+    let mut value = String::new();
+
+    let mut flush = |name: Option<&'static str>, value: &str| {
+        let ids = message_ids(value);
+        match name {
+            Some("in-reply-to") => {
+                if let Some(first) = ids.into_iter().next() {
+                    in_reply_to = first;
+                }
+            }
+            Some("references") => references = ids,
+            _ => {}
+        }
+    };
+
+    for line in text.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            value.push(' ');
+            value.push_str(line.trim());
+            continue;
+        }
+        flush(current, &value);
+        current = None;
+        value.clear();
+        if let Some((name, rest)) = line.split_once(':') {
+            current = match name.trim().to_ascii_lowercase().as_str() {
+                "in-reply-to" => Some("in-reply-to"),
+                "references" => Some("references"),
+                _ => None,
+            };
+            if current.is_some() {
+                value.push_str(rest.trim());
+            }
+        }
+    }
+    flush(current, &value);
+    (in_reply_to, references)
+}
+
+/// Pull every `<id>` out of a header value (References lists several).
+fn message_ids(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .filter_map(|token| {
+            let id = crate::threading::normalize_message_id(token);
+            (!id.is_empty()).then_some(id)
+        })
+        .collect()
 }
 
 fn address_of(address: &imap_proto::Address<'_>) -> Address {

@@ -43,10 +43,10 @@ pub struct Flags {
 }
 
 impl Flags {
-    const SEEN: i64 = 1 << 0;
-    const ANSWERED: i64 = 1 << 1;
-    const FLAGGED: i64 = 1 << 2;
-    const DRAFT: i64 = 1 << 3;
+    pub(crate) const SEEN: i64 = 1 << 0;
+    pub(crate) const ANSWERED: i64 = 1 << 1;
+    pub(crate) const FLAGGED: i64 = 1 << 2;
+    pub(crate) const DRAFT: i64 = 1 << 3;
 
     pub fn to_i64(self) -> i64 {
         let mut bits = 0;
@@ -86,6 +86,10 @@ pub struct Message {
     pub message_id: String,
     /// Conversation this message belongs to (see [`crate::threading`]).
     pub thread_id: String,
+    /// RFC 5322 `In-Reply-To`, if any.
+    pub in_reply_to: String,
+    /// RFC 5322 `References` message-ids, in order.
+    pub references: Vec<String>,
     pub subject: String,
     pub from: Address,
     pub to: Vec<Address>,
@@ -114,6 +118,8 @@ pub struct NewMessage {
     pub uid: u32,
     pub message_id: String,
     pub thread_id: String,
+    pub in_reply_to: String,
+    pub references: Vec<String>,
     pub subject: String,
     pub from: Address,
     pub to: Vec<Address>,
@@ -131,4 +137,16 @@ pub struct NewMessage {
 pub struct MessageBody {
     pub text: Option<String>,
     pub html: Option<String>,
+}
+
+/// Metadata for one MIME attachment (contents are not cached in M3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Attachment {
+    pub filename: String,
+    pub mime: String,
+    pub size: u64,
+    pub content_id: Option<String>,
+    pub inline: bool,
+    /// MIME part path, e.g. `2`.
+    pub part: String,
 }

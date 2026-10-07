@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::events::Event;
 use crate::folder::SpecialUse;
 use crate::imap::{ImapSession, ImapSettings, TlsTrust};
-use crate::message::{Flags, MessageId};
+use crate::message::{Attachment, Flags, MessageId};
 use crate::secrets;
 
 /// Commands the UI can send to an account's sync worker.
@@ -29,6 +29,13 @@ pub enum SyncCommand {
     SetFlags { message: MessageId, flags: Flags },
     /// Move a message to a special-use folder on the server.
     Move { message: MessageId, to: SpecialUse },
+    /// Set `\Seen` on every message in the conversation identified by `message`.
+    SetThreadSeen { message: MessageId, seen: bool },
+    /// Set `\Flagged` on every message in the conversation identified by `message`.
+    SetThreadFlagged { message: MessageId, flagged: bool },
+    /// Move every message of the conversation (those in the representative's
+    /// folder) to a special-use folder.
+    MoveThread { message: MessageId, to: SpecialUse },
     /// Fetch and cache a message body.
     FetchBody { message: MessageId },
 }
@@ -276,6 +283,23 @@ async fn run_session(
             Some(SyncCommand::Move { message, to }) => {
                 apply_move(db, &mut conn, account, message, to, events).await?;
             }
+            Some(SyncCommand::SetThreadSeen { message, seen }) => {
+                apply_thread_flags(db, &mut conn, message, ThreadFlagChange::Seen(seen), events)
+                    .await?;
+            }
+            Some(SyncCommand::SetThreadFlagged { message, flagged }) => {
+                apply_thread_flags(
+                    db,
+                    &mut conn,
+                    message,
+                    ThreadFlagChange::Flagged(flagged),
+                    events,
+                )
+                .await?;
+            }
+            Some(SyncCommand::MoveThread { message, to }) => {
+                apply_move_thread(db, &mut conn, message, to, events).await?;
+            }
             Some(SyncCommand::FetchBody { message }) => {
                 apply_fetch_body(db, &mut conn, message, events).await?;
             }
@@ -342,6 +366,7 @@ async fn sync_all_folders(
             })
             .ok();
     }
+    db.rethread_account(account)?;
     events.send(Event::SyncFinished { account }).ok();
     Ok((folder_ids, inbox_path))
 }
@@ -374,6 +399,7 @@ async fn sync_folder(
     };
 
     let mut highest = since;
+    let mut inserted = false;
     for message in &messages {
         // `UID FETCH n:*` may re-report the last message we already have.
         if message.uid <= since {
@@ -384,6 +410,12 @@ async fn sync_folder(
         new_message.folder_id = folder_id;
         db.upsert_message(&new_message)?;
         highest = highest.max(message.uid);
+        inserted = true;
+    }
+    // New headers can link previously-separate conversations, so rebuild the
+    // account's thread assignment whenever anything changed.
+    if inserted {
+        db.rethread_account(account)?;
     }
     let unread = count_unread(db, folder_id)?;
     db.set_folder_state(
@@ -460,6 +492,108 @@ async fn apply_move(
     Ok(())
 }
 
+/// Which conversation-wide flag bit to apply.
+#[derive(Clone, Copy)]
+enum ThreadFlagChange {
+    Seen(bool),
+    Flagged(bool),
+}
+
+/// Apply a `\Seen`/`\Flagged` change to every message in a conversation.
+async fn apply_thread_flags(
+    db: &Db,
+    session: &mut ImapSession,
+    identify: MessageId,
+    change: ThreadFlagChange,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<()> {
+    let Some(message) = db.get_message(identify)? else {
+        return Ok(());
+    };
+    let account = message.account_id;
+    let folder = message.folder_id;
+    let locations = db.thread_locations(account, &message.thread_id)?;
+
+    let mut changed = false;
+    for (id, _folder, path, uid, flags) in &locations {
+        let mut new_flags = *flags;
+        let dirty = match change {
+            ThreadFlagChange::Seen(seen) => {
+                let dirty = new_flags.seen != seen;
+                new_flags.seen = seen;
+                dirty
+            }
+            ThreadFlagChange::Flagged(flagged) => {
+                let dirty = new_flags.flagged != flagged;
+                new_flags.flagged = flagged;
+                dirty
+            }
+        };
+        if !dirty {
+            continue;
+        }
+        session.set_flags(path, *uid, new_flags).await?;
+        db.set_flags(*id, new_flags)?;
+        changed = true;
+    }
+    if changed {
+        events.send(Event::MessagesChanged { account, folder }).ok();
+    }
+    Ok(())
+}
+
+/// Move every message of a conversation that lives in the representative's
+/// folder (so archiving a thread does not drag along its Sent copies).
+async fn apply_move_thread(
+    db: &Db,
+    session: &mut ImapSession,
+    identify: MessageId,
+    to: SpecialUse,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<()> {
+    let Some(message) = db.get_message(identify)? else {
+        return Ok(());
+    };
+    let account = message.account_id;
+    let folder_id = message.folder_id;
+    let destination = db
+        .folders(account)?
+        .into_iter()
+        .find(|folder| folder.special_use == to)
+        .map(|folder| folder.path);
+    let locations = db.thread_locations(account, &message.thread_id)?;
+
+    match destination {
+        Some(destination) => {
+            for (id, folder, path, uid, _) in &locations {
+                if *folder != folder_id {
+                    continue;
+                }
+                session.move_message(path, *uid, &destination).await?;
+                db.delete_message(*id)?;
+            }
+        }
+        None => {
+            for (id, folder, path, uid, flags) in &locations {
+                if *folder != folder_id {
+                    continue;
+                }
+                let mut new_flags = *flags;
+                new_flags.seen = true;
+                session.set_flags(path, *uid, new_flags).await?;
+                db.set_flags(*id, new_flags)?;
+            }
+        }
+    }
+    events
+        .send(Event::MessagesChanged {
+            account,
+            folder: folder_id,
+        })
+        .ok();
+    Ok(())
+}
+
 async fn apply_fetch_body(
     db: &Db,
     session: &mut ImapSession,
@@ -487,6 +621,41 @@ async fn apply_fetch_body(
         .map(|html| html.to_string());
     let snippet = snippet_of(text.as_deref().unwrap_or(""));
     db.set_body(message, text.as_deref(), html.as_deref(), &snippet)?;
+
+    // Attachment metadata (contents are not cached).
+    let attachments = parsed
+        .as_ref()
+        .map(|mail| {
+            use mail_parser::MimeHeaders;
+            mail.attachments()
+                .enumerate()
+                .map(|(index, part)| {
+                    let mime = match part.content_type() {
+                        Some(content_type) => match content_type.subtype() {
+                            Some(subtype) => {
+                                format!("{}/{}", content_type.ctype(), subtype)
+                            }
+                            None => content_type.ctype().to_string(),
+                        },
+                        None => String::new(),
+                    };
+                    let inline = part
+                        .content_disposition()
+                        .map(|disposition| disposition.is_inline())
+                        .unwrap_or_else(|| part.content_id().is_some());
+                    Attachment {
+                        filename: part.attachment_name().unwrap_or("").to_string(),
+                        mime,
+                        size: part.contents().len() as u64,
+                        content_id: part.content_id().map(str::to_string),
+                        inline,
+                        part: index.to_string(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    db.set_attachments(message, &attachments)?;
     events
         .send(Event::MessagesChanged { account, folder: folder_id })
         .ok();

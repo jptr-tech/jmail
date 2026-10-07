@@ -1,5 +1,13 @@
 //! In-memory mailbox used by the mock IMAP server.
 
+/// An attachment carried by a [`MockMessage`].
+#[derive(Clone, Debug)]
+pub struct MockAttachment {
+    pub filename: String,
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
 /// A message stored in the mock server. Structured fields drive both the
 /// RFC 822 rendering and the ENVELOPE response.
 #[derive(Clone, Debug)]
@@ -11,9 +19,12 @@ pub struct MockMessage {
     pub from_email: String,
     pub to: Vec<(String, String)>,
     pub message_id: String,
+    pub in_reply_to: String,
+    pub references: Vec<String>,
     pub date: String,
     pub text: String,
     pub html: Option<String>,
+    pub attachments: Vec<MockAttachment>,
     pub flags: Vec<String>,
 }
 
@@ -39,16 +50,47 @@ impl MockMessage {
                 .map(|(name, email)| (name.to_string(), email.to_string()))
                 .collect(),
             message_id: message_id.to_string(),
+            in_reply_to: String::new(),
+            references: Vec::new(),
             date: date.to_string(),
             text: text.to_string(),
             html: None,
+            attachments: Vec::new(),
             flags: flags.iter().map(|f| f.to_string()).collect(),
         }
+    }
+
+    /// Attach a file (`multipart/mixed`, base64-encoded).
+    pub fn with_attachment(mut self, filename: &str, mime: &str, data: &[u8]) -> Self {
+        self.attachments.push(MockAttachment {
+            filename: filename.to_string(),
+            mime: mime.to_string(),
+            data: data.to_vec(),
+        });
+        self
     }
 
     /// Attach an HTML alternative body (renders as `multipart/alternative`).
     pub fn with_html(mut self, html: &str) -> Self {
         self.html = Some(html.to_string());
+        self
+    }
+
+    /// Mark this message as a reply to `parent` (sets `In-Reply-To` and
+    /// `References` so the client can reconstruct the thread).
+    pub fn reply_to(mut self, parent: &str) -> Self {
+        self.in_reply_to = parent.to_string();
+        if self.references.is_empty() {
+            self.references.push(parent.to_string());
+        } else if !self.references.iter().any(|r| r == parent) {
+            self.references.push(parent.to_string());
+        }
+        self
+    }
+
+    /// Set the full `References` chain explicitly.
+    pub fn with_references(mut self, references: &[&str]) -> Self {
+        self.references = references.iter().map(|r| r.to_string()).collect();
         self
     }
 
@@ -65,15 +107,27 @@ impl MockMessage {
             .map(|(name, email)| format!("{name} <{email}>"))
             .collect::<Vec<_>>()
             .join(", ");
-        let headers = format!(
+        let mut headers = format!(
             "Message-ID: <{}>\r\nDate: {}\r\nSubject: {}\r\nFrom: {}\r\nTo: {}",
             self.message_id, self.date, self.subject, from, to
         );
-        match &self.html {
+        if !self.in_reply_to.is_empty() {
+            headers.push_str(&format!("\r\nIn-Reply-To: <{}>", self.in_reply_to));
+        }
+        if !self.references.is_empty() {
+            let refs = self
+                .references
+                .iter()
+                .map(|r| format!("<{r}>"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            headers.push_str(&format!("\r\nReferences: {refs}"));
+        }
+        let body = match &self.html {
             Some(html) => {
                 let boundary = "jmail-mock-boundary";
                 format!(
-                    "{headers}\r\nContent-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n\
+                    "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n\
                      --{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n\
                      --{boundary}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{}\r\n\
                      --{boundary}--\r\n",
@@ -81,10 +135,31 @@ impl MockMessage {
                 )
             }
             None => format!(
-                "{headers}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
                 self.text
             ),
+        };
+
+        if self.attachments.is_empty() {
+            return format!("{headers}\r\n{body}");
         }
+
+        let mut raw = format!(
+            "{headers}\r\nContent-Type: multipart/mixed; boundary=\"jmail-mock-mixed\"\r\n\r\n\
+             --jmail-mock-mixed\r\n{body}\r\n"
+        );
+        for attachment in &self.attachments {
+            raw.push_str(&format!(
+                "--jmail-mock-mixed\r\nContent-Type: {}\r\n\
+                 Content-Disposition: attachment; filename=\"{}\"\r\n\
+                 Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+                attachment.mime,
+                attachment.filename,
+                wrap_base64(&base64(&attachment.data))
+            ));
+        }
+        raw.push_str("--jmail-mock-mixed--\r\n");
+        raw
     }
 
     /// IMAP `ENVELOPE` structure:
@@ -101,8 +176,13 @@ impl MockMessage {
         } else {
             format!("({})", self.to.iter().map(addr).collect::<Vec<_>>().join(" "))
         };
+        let in_reply_to = if self.in_reply_to.is_empty() {
+            "NIL".to_string()
+        } else {
+            format!("{:?}", self.in_reply_to)
+        };
         format!(
-            "({:?} {:?} {from} {from} {from} {to} NIL NIL NIL {:?})",
+            "({:?} {:?} {from} {from} {from} {to} NIL NIL {in_reply_to} {:?})",
             self.date, self.subject, self.message_id,
         )
     }
@@ -118,6 +198,45 @@ impl MockMessage {
 
 pub(crate) fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// RFC 4648 base64 (standard alphabet, `=` padding) for attachment bodies.
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Wrap base64 into 76-character MIME lines.
+fn wrap_base64(encoded: &str) -> String {
+    let mut out = String::with_capacity(encoded.len() + encoded.len() / 76 + 1);
+    let mut start = 0;
+    while start < encoded.len() {
+        let end = (start + 76).min(encoded.len());
+        out.push_str(&encoded[start..end]);
+        out.push_str("\r\n");
+        start = end;
+    }
+    out
 }
 
 /// A folder in the mock server.
@@ -274,9 +393,12 @@ impl MockMailbox {
 <script>alert('this script must be stripped')</script>
 </body>
 </html>"#),
-            MockMessage::new("Re: Welcome to Jmail", "Ada Lovelace", "ada@example.org", &me, "m2@example.org", "Mon, 05 Oct 2026 09:30:00 +0000", "Did the conversation view land?", &["\\Seen"]),
-            MockMessage::new("Quarterly report", "Grace Hopper", "grace@example.org", &me, "m3@example.org", "Sun, 04 Oct 2026 14:05:00 +0000", "Attached is the quarterly report.", &[]),
-            MockMessage::new("Re: Quarterly report", "Grace Hopper", "grace@example.org", &me, "m4@example.org", "Sun, 04 Oct 2026 18:44:00 +0000", "Thanks, reviewed it.", &["\\Seen", "\\Flagged"]),
+            MockMessage::new("Re: Welcome to Jmail", "Ada Lovelace", "ada@example.org", &me, "m2@example.org", "Mon, 05 Oct 2026 09:30:00 +0000", "Did the conversation view land?\n\n> Hi! This is the first message in the mock inbox.\n> It should be folded away.", &["\\Seen"])
+                .reply_to("m1@example.org"),
+            MockMessage::new("Quarterly report", "Grace Hopper", "grace@example.org", &me, "m3@example.org", "Sun, 04 Oct 2026 14:05:00 +0000", "Attached is the quarterly report.", &[])
+                .with_attachment("quarterly-report.pdf", "application/pdf", b"%PDF-1.4 mock quarterly report\n"),
+            MockMessage::new("Re: Quarterly report", "Grace Hopper", "grace@example.org", &me, "m4@example.org", "Sun, 04 Oct 2026 18:44:00 +0000", "Thanks, reviewed it.", &["\\Seen", "\\Flagged"])
+                .reply_to("m3@example.org"),
             MockMessage::new("Lunch tomorrow?", "Alan Turing", "alan@example.org", &me, "m5@example.org", "Fri, 02 Oct 2026 11:00:00 +0000", "Fancy lunch at noon?", &[]),
         ];
         for message in inbox {
@@ -284,7 +406,8 @@ impl MockMailbox {
         }
         mailbox.push(
             "Sent",
-            MockMessage::new("Re: Welcome to Jmail", "You", "you@example.com", &[("Ada Lovelace", "ada@example.org")], "s1@example.org", "Mon, 05 Oct 2026 09:31:00 +0000", "It landed, thanks!", &["\\Seen"]),
+            MockMessage::new("Re: Welcome to Jmail", "You", "you@example.com", &[("Ada Lovelace", "ada@example.org")], "s1@example.org", "Mon, 05 Oct 2026 09:31:00 +0000", "It landed, thanks!", &["\\Seen"])
+                .reply_to("m2@example.org"),
         );
         mailbox.push(
             "Drafts",

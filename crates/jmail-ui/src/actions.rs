@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -5,7 +6,7 @@ use adw::prelude::*;
 use gtk::gio;
 use gtk::glib::BoxedAnyObject;
 
-use jmail_core::{AccountId, Db, MessageId, SpecialUse, SyncCommand};
+use jmail_core::{AccountId, Attachment, Db, MessageId, SpecialUse, SyncCommand};
 
 use crate::message_row::{format_timestamp, MessageRow};
 use crate::window::Ui;
@@ -189,22 +190,6 @@ fn move_selection(ui: &Ui, delta: i32) {
     );
 }
 
-/// Replace the selected store item in place so the row widget rebinds.
-fn replace_row(ui: &Ui, row: &MessageRow) {
-    let Some(item) = ui.selection.selected_item() else {
-        return;
-    };
-    let Some(position) = ui.store.find(&item) else {
-        return;
-    };
-    let filter_position = ui.selection.selected();
-    ui.store
-        .splice(position, 1, &[BoxedAnyObject::new(row.clone())]);
-    if filter_position != u32::MAX {
-        ui.select_quietly(filter_position);
-    }
-}
-
 /// Preview the message at `position` in the reading pane (hover / j / k).
 pub(crate) fn request_preview(ui: &Ui, position: u32) {
     if ui.suppress_preview.get() || ui.list_split.is_collapsed() {
@@ -240,18 +225,18 @@ fn begin_preview(ui: &Ui, row: &MessageRow, show_content: bool) {
     *ui.preview_row.borrow_mut() = Some(row.clone());
 
     render_preview(ui, row);
-    ensure_body(ui, row);
+    ensure_thread_bodies(ui, row);
     if show_content {
         ui.list_split.set_show_content(true);
     }
     ui.status_label.set_text(&format!("Reading: {}", row.subject));
 
-    if row.unread {
+    if row.unread_count > 0 {
         let handle = ui.clone();
-        let id = row.id;
+        let row = row.clone();
         gtk::glib::timeout_add_local_once(Duration::from_secs(2), move || {
             if handle.preview_generation.get() == generation {
-                mark_read_by_id(&handle, id);
+                mark_thread_read(&handle, &row);
             }
         });
     }
@@ -291,6 +276,9 @@ struct RenderedMessage {
     date: String,
     text: String,
     html: Option<String>,
+    /// Display name of the message this one replies to, when known.
+    reply_to: Option<String>,
+    attachments: Vec<Attachment>,
 }
 
 /// Build render data for every message in `row`'s conversation, oldest first.
@@ -306,8 +294,13 @@ fn thread_render_data(db: &Db, row: &MessageRow) -> Vec<RenderedMessage> {
             date: row.date_label.clone(),
             text: row.snippet.clone(),
             html: None,
+            reply_to: None,
+            attachments: Vec::new(),
         }];
     }
+
+    let senders = sender_by_message_id(&messages);
+
     messages
         .iter()
         .map(|message| {
@@ -323,6 +316,7 @@ fn thread_render_data(db: &Db, row: &MessageRow) -> Vec<RenderedMessage> {
                 ),
                 None => (message.snippet.clone(), None),
             };
+            let reply_to = reply_to_name(&senders, &message.in_reply_to);
             RenderedMessage {
                 id: message.id.0,
                 has_body,
@@ -330,9 +324,40 @@ fn thread_render_data(db: &Db, row: &MessageRow) -> Vec<RenderedMessage> {
                 date: format_timestamp(message.date.unix_timestamp()),
                 text,
                 html,
+                reply_to,
+                attachments: db.attachments(message.id).unwrap_or_default(),
             }
         })
         .collect()
+}
+
+/// Map every `Message-ID` in a conversation to its sender, so a reply can name
+/// who it answers.
+fn sender_by_message_id(messages: &[jmail_core::Message]) -> HashMap<String, String> {
+    let mut senders = HashMap::new();
+    for message in messages {
+        let id = jmail_core::threading::normalize_message_id(&message.message_id);
+        if !id.is_empty() {
+            senders
+                .entry(id)
+                .or_insert_with(|| message.from.display().to_string());
+        }
+    }
+    senders
+}
+
+fn reply_to_name(senders: &HashMap<String, String>, in_reply_to: &str) -> Option<String> {
+    let parent = jmail_core::threading::normalize_message_id(in_reply_to);
+    if parent.is_empty() {
+        None
+    } else {
+        Some(
+            senders
+                .get(&parent)
+                .cloned()
+                .unwrap_or_else(|| "an earlier message".to_string()),
+        )
+    }
 }
 
 /// A message cell whose body WebView is created once and then reused.
@@ -340,7 +365,11 @@ pub(crate) struct MessageCell {
     root: gtk::Box,
     who: gtk::Label,
     when: gtk::Label,
+    /// "in reply to …" attribution line, hidden for thread starters.
+    reply_label: gtk::Label,
     view: webkit6::WebView,
+    /// Rebuilt for each message; holds the attachment chips.
+    attachments_box: gtk::Box,
     /// `(message id, body available, dark theme)` of the content currently
     /// loaded, so a redundant `reload_preview` (e.g. after a flag change) does
     /// not repaint the body.
@@ -372,6 +401,14 @@ impl MessageCell {
         head.append(&when);
         root.append(&head);
 
+        let reply_label = gtk::Label::new(None);
+        reply_label.set_xalign(0.0);
+        reply_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        reply_label.add_css_class("dim-label");
+        reply_label.add_css_class("caption");
+        reply_label.set_visible(false);
+        root.append(&reply_label);
+
         let view = webkit6::WebView::new();
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
             settings.set_enable_javascript(true);
@@ -379,6 +416,7 @@ impl MessageCell {
             settings.set_enable_developer_extras(false);
             settings.set_auto_load_images(false);
         }
+        install_webview_policy(&view);
         view.set_background_color(&theme.bg);
         view.set_hexpand(true);
         view.set_vexpand(false);
@@ -414,11 +452,18 @@ impl MessageCell {
         });
 
         root.append(&view);
+
+        let attachments_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        attachments_box.set_visible(false);
+        root.append(&attachments_box);
+
         Self {
             root,
             who,
             when,
+            reply_label,
             view,
+            attachments_box,
             last: std::cell::RefCell::new(None),
         }
     }
@@ -433,18 +478,32 @@ impl MessageCell {
 
         self.who.set_text(&message.sender);
         self.when.set_text(&message.date);
+        // Reply attribution: who this message answers.
+        match &message.reply_to {
+            Some(name) => {
+                self.reply_label.set_text(&format!("↳ in reply to {name}"));
+                self.reply_label.set_visible(true);
+            }
+            None => self.reply_label.set_visible(false),
+        }
+        self.set_attachments(&message.attachments);
 
         let html = match &message.html {
-            Some(html) => themed_html(html, theme),
-            None => themed_html(
-                &format!(
-                    "<pre style=\"white-space: pre-wrap; overflow-wrap: anywhere; margin: 0;\">{}</pre>",
-                    escape_html(&message.text)
-                ),
-                theme,
-            ),
+            Some(html) => themed_html(&collapse_quotes(html), theme),
+            None => themed_html(&text_body_html(&message.text), theme),
         };
         self.load_html(&html, theme);
+    }
+
+    /// Replace the attachment chips shown under the body.
+    fn set_attachments(&self, attachments: &[Attachment]) {
+        while let Some(child) = self.attachments_box.first_child() {
+            self.attachments_box.remove(&child);
+        }
+        self.attachments_box.set_visible(!attachments.is_empty());
+        for attachment in attachments {
+            self.attachments_box.append(&attachment_row(attachment));
+        }
     }
 
     /// Load a blank themed page so WebKit creates and paints its compositing
@@ -499,6 +558,207 @@ fn escape_html(input: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Intercept link clicks and hand the URI to the desktop instead of navigating
+/// the message view. Page-initiated navigation and `target="_blank"` popups are
+/// blocked as well.
+fn install_webview_policy(view: &webkit6::WebView) {
+    use webkit6::prelude::*;
+
+    view.connect_decide_policy(|_, decision, decision_type| {
+        // Only user link clicks are intercepted. Everything else (in particular
+        // the programmatic `load_html` that renders a body) is left to WebKit,
+        // otherwise the message itself would be blocked.
+        if decision_type != webkit6::PolicyDecisionType::NavigationAction {
+            return false;
+        }
+        let is_link = decision
+            .downcast_ref::<webkit6::NavigationPolicyDecision>()
+            .and_then(|nav| nav.navigation_action())
+            .is_some_and(|action| action.navigation_type() == webkit6::NavigationType::LinkClicked);
+        if is_link {
+            if let Some(uri) = decision
+                .downcast_ref::<webkit6::NavigationPolicyDecision>()
+                .and_then(|nav| nav.navigation_action())
+                .and_then(|action| action.request())
+                .and_then(|request| request.uri())
+            {
+                open_external(&uri);
+            }
+            decision.ignore();
+            return true;
+        }
+        false
+    });
+
+    view.connect_create(|_, action| {
+        if let Some(uri) = action.request().and_then(|request| request.uri()) {
+            open_external(&uri);
+        }
+        None
+    });
+}
+
+/// Open a link with the desktop's URI handler (Android/iOS-style handoff via
+/// `GtkUriLauncher`, which uses the OpenURI portal inside Flatpak).
+fn open_external(uri: &str) {
+    if !(uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("mailto:")) {
+        tracing::debug!(%uri, "ignoring unsupported link scheme");
+        return;
+    }
+    let uri = uri.to_string();
+    gtk::UriLauncher::new(&uri).launch(
+        None::<&gtk::Window>,
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            if let Err(error) = result {
+                tracing::warn!(%error, %uri, "could not open link");
+            }
+        },
+    );
+}
+
+/// A single attachment chip: icon, name and human-readable size.
+fn attachment_row(attachment: &Attachment) -> gtk::Widget {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("attachment");
+    row.set_margin_top(2);
+    row.set_margin_bottom(2);
+
+    let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
+    icon.set_valign(gtk::Align::Center);
+    row.append(&icon);
+
+    let name = if attachment.filename.is_empty() {
+        if attachment.mime.is_empty() {
+            "(unnamed attachment)".to_string()
+        } else {
+            attachment.mime.clone()
+        }
+    } else {
+        attachment.filename.clone()
+    };
+    let label = gtk::Label::new(Some(&name));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    row.append(&label);
+
+    let size = gtk::Label::new(Some(&format_size(attachment.size)));
+    size.add_css_class("dim-label");
+    size.add_css_class("caption");
+    size.set_valign(gtk::Align::Center);
+    row.append(&size);
+
+    row.upcast()
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Wrap each top-level `<blockquote>` in a collapsible `<details>`.
+fn collapse_quotes(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len() + 64);
+    let mut cursor = 0;
+    let mut depth: i32 = 0;
+    while cursor < html.len() {
+        let Some(rel) = lower[cursor..].find('<') else {
+            out.push_str(&html[cursor..]);
+            break;
+        };
+        let start = cursor + rel;
+        out.push_str(&html[cursor..start]);
+        let Some(end) = lower[start..].find('>').map(|gt| start + gt + 1) else {
+            out.push_str(&html[start..]);
+            break;
+        };
+        let tag = &html[start..end];
+        let lower_tag = &lower[start..end];
+        if tag_name(lower_tag).as_deref() == Some("blockquote") {
+            if lower_tag.starts_with("</") {
+                out.push_str(tag);
+                depth = (depth - 1).max(0);
+                if depth == 0 {
+                    out.push_str("</details>");
+                }
+            } else {
+                if depth == 0 {
+                    out.push_str(
+                        "<details class=\"quote\"><summary>Show quoted text</summary>",
+                    );
+                }
+                depth += 1;
+                out.push_str(tag);
+            }
+        } else {
+            out.push_str(tag);
+        }
+        cursor = end;
+    }
+    out
+}
+
+/// Render a plain-text body, folding runs of `>`-quoted lines into a
+/// collapsible `<details>` block.
+fn text_body_html(text: &str) -> String {
+    const PRE: &str =
+        "<pre style=\"white-space: pre-wrap; overflow-wrap: anywhere; margin: 0;\">";
+    let mut out = String::new();
+    let mut normal = String::new();
+    let mut quoted = String::new();
+
+    fn flush_normal(normal: &mut String, out: &mut String) {
+        if !normal.is_empty() {
+            out.push_str(
+                "<pre style=\"white-space: pre-wrap; overflow-wrap: anywhere; margin: 0;\">",
+            );
+            out.push_str(&escape_html(normal));
+            out.push_str("</pre>");
+            normal.clear();
+        }
+    }
+    fn flush_quoted(quoted: &mut String, out: &mut String) {
+        if !quoted.is_empty() {
+            out.push_str("<details class=\"quote\"><summary>Show quoted text</summary>");
+            out.push_str(
+                "<pre style=\"white-space: pre-wrap; overflow-wrap: anywhere; margin: 0;\">",
+            );
+            out.push_str(&escape_html(quoted));
+            out.push_str("</pre></details>");
+            quoted.clear();
+        }
+    }
+
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with('>') {
+            flush_normal(&mut normal, &mut out);
+            quoted.push_str(line);
+        } else {
+            flush_quoted(&mut quoted, &mut out);
+            normal.push_str(line);
+        }
+    }
+    flush_quoted(&mut quoted, &mut out);
+    flush_normal(&mut normal, &mut out);
+    if out.is_empty() {
+        out.push_str(PRE);
+        out.push_str("</pre>");
+    }
+    out
+}
+
 /// Re-render the reading pane (e.g. after a body finished fetching).
 pub(crate) fn reload_preview(ui: &Ui) {
     if let Some(row) = ui.preview_row.borrow().clone() {
@@ -506,76 +766,54 @@ pub(crate) fn reload_preview(ui: &Ui) {
     }
 }
 
-/// Ask the sync engine for a message body if it is not cached yet.
-fn ensure_body(ui: &Ui, row: &MessageRow) {
-    let cached = ui
-        .db
-        .message_body(MessageId(row.id))
-        .ok()
-        .flatten()
-        .map(|body| body.text.is_some() || body.html.is_some())
-        .unwrap_or(false);
-    if cached {
+/// Ask the sync engine for the body of every message in the conversation that
+/// is not cached yet.
+fn ensure_thread_bodies(ui: &Ui, row: &MessageRow) {
+    let account = AccountId(row.account_id);
+    if !ui.engine.is_running(account) {
         return;
     }
+    let Ok(messages) = ui.db.thread_messages(account, &row.thread_id, 50) else {
+        return;
+    };
+    for message in messages {
+        let cached = ui
+            .db
+            .message_body(message.id)
+            .ok()
+            .flatten()
+            .map(|body| body.text.is_some() || body.html.is_some())
+            .unwrap_or(false);
+        if !cached {
+            ui.engine
+                .send(account, SyncCommand::FetchBody { message: message.id });
+        }
+    }
+}
+
+/// Mark every message in a conversation read, updating the cache, the list and
+/// the server.
+fn mark_thread_read(ui: &Ui, row: &MessageRow) {
     let account = AccountId(row.account_id);
-    if ui.engine.is_running(account) {
-        ui.engine.send(
-            account,
-            SyncCommand::FetchBody {
-                message: MessageId(row.id),
-            },
-        );
+    match ui.db.set_thread_seen(account, &row.thread_id, true) {
+        Ok(ids) if !ids.is_empty() => {
+            if ui.engine.is_running(account) {
+                ui.engine.send(
+                    account,
+                    SyncCommand::SetThreadSeen {
+                        message: MessageId(row.id),
+                        seen: true,
+                    },
+                );
+            }
+        }
+        Ok(_) => return,
+        Err(error) => {
+            tracing::error!(%error, "failed to mark conversation read");
+            return;
+        }
     }
-}
-
-/// Mark a message read, updating the cache, the list row and the server.
-fn mark_read_by_id(ui: &Ui, id: i64) {
-    let mut update = None;
-    update_row_by_id(ui, id, |row| {
-        if row.unread {
-            row.unread = false;
-            row.flags.seen = true;
-            update = Some((row.account_id, row.flags));
-        }
-    });
-    if let Some((account, flags)) = update {
-        if let Err(error) = ui.db.set_flags(MessageId(id), flags) {
-            tracing::error!(%error, "failed to mark read");
-        }
-        ui.engine.send(
-            AccountId(account),
-            SyncCommand::SetFlags {
-                message: MessageId(id),
-                flags,
-            },
-        );
-    }
-}
-
-/// Apply `update` to the store row with the given message id.
-fn update_row_by_id(ui: &Ui, id: i64, update: impl FnOnce(&mut MessageRow)) {
-    // Replacing a store item drops the selection (object identity changes), so
-    // remember the selected row and restore it once the splice is done.
-    let selected = ui.selection.selected();
-    for position in 0..ui.store.n_items() {
-        let Some(item) = ui.store.item(position) else {
-            continue;
-        };
-        let Ok(boxed) = item.downcast::<BoxedAnyObject>() else {
-            continue;
-        };
-        if boxed.borrow::<MessageRow>().id != id {
-            continue;
-        }
-        let mut row = boxed.borrow::<MessageRow>().clone();
-        update(&mut row);
-        ui.store.splice(position, 1, &[BoxedAnyObject::new(row)]);
-        if selected != u32::MAX {
-            ui.select_quietly(selected);
-        }
-        break;
-    }
+    ui.reload_messages();
 }
 
 fn close_or_back(ui: &Ui) {
@@ -595,50 +833,55 @@ fn open_search(ui: &Ui) {
 }
 
 fn toggle_star(ui: &Ui) {
-    let Some(mut row) = selected_row(ui) else {
+    let Some(row) = selected_row(ui) else {
         return;
     };
-    row.starred = !row.starred;
-    row.flags.flagged = row.starred;
-    if let Err(error) = ui.db.set_flags(MessageId(row.id), row.flags) {
+    // Star the whole conversation unless every message is already starred.
+    let star = !(row.message_count > 0 && row.starred_count == row.message_count);
+    let account = AccountId(row.account_id);
+    if let Err(error) = ui.db.set_thread_flagged(account, &row.thread_id, star) {
         tracing::error!(%error, "failed to update flags");
     }
-    ui.engine.send(
-        AccountId(row.account_id),
-        SyncCommand::SetFlags {
-            message: MessageId(row.id),
-            flags: row.flags,
-        },
-    );
-    replace_row(ui, &row);
+    if ui.engine.is_running(account) {
+        ui.engine.send(
+            account,
+            SyncCommand::SetThreadFlagged {
+                message: MessageId(row.id),
+                flagged: star,
+            },
+        );
+    }
+    ui.reload_messages();
     ui.status_label
-        .set_text(if row.starred { "Starred" } else { "Unstarred" });
+        .set_text(if star { "Starred" } else { "Unstarred" });
 }
 
 fn set_unread(ui: &Ui, unread: bool) {
-    let Some(mut row) = selected_row(ui) else {
+    let Some(row) = selected_row(ui) else {
         return;
     };
-    row.unread = unread;
-    row.flags.seen = !unread;
-    if let Err(error) = ui.db.set_flags(MessageId(row.id), row.flags) {
+    let account = AccountId(row.account_id);
+    if let Err(error) = ui.db.set_thread_seen(account, &row.thread_id, !unread) {
         tracing::error!(%error, "failed to update flags");
     }
-    ui.engine.send(
-        AccountId(row.account_id),
-        SyncCommand::SetFlags {
-            message: MessageId(row.id),
-            flags: row.flags,
-        },
-    );
-    replace_row(ui, &row);
+    if ui.engine.is_running(account) {
+        ui.engine.send(
+            account,
+            SyncCommand::SetThreadSeen {
+                message: MessageId(row.id),
+                seen: !unread,
+            },
+        );
+    }
+    ui.reload_messages();
     ui.status_label
         .set_text(if unread { "Marked unread" } else { "Marked read" });
 }
 
-/// Move the selected message to a special-use folder. When the account is
+/// Move the selected conversation to a special-use folder. When the account is
 /// syncing, the engine applies it on the server and the list refreshes; when
-/// offline, the cache is updated directly.
+/// offline, the cache is updated directly. Only messages in the folder the row
+/// represents move, so archiving a thread does not drag along its Sent copies.
 fn move_selected(ui: &Ui, special_use: SpecialUse, verb: &'static str) {
     let Some(row) = selected_row(ui) else {
         return;
@@ -647,12 +890,22 @@ fn move_selected(ui: &Ui, special_use: SpecialUse, verb: &'static str) {
     let message = MessageId(row.id);
 
     if ui.engine.is_running(account) {
-        ui.engine.send(account, SyncCommand::Move { message, to: special_use });
-        ui.status_label.set_text(&format!("{verb} message"));
+        ui.engine.send(
+            account,
+            SyncCommand::MoveThread {
+                message,
+                to: special_use,
+            },
+        );
+        ui.status_label.set_text(&format!("{verb} conversation"));
         return;
     }
 
-    let filter_position = ui.selection.selected();
+    let Some((_account, _path, folder_id, _uid, _flags)) =
+        ui.db.message_location(message).ok().flatten()
+    else {
+        return;
+    };
     let target = ui
         .db
         .folders(account)
@@ -663,23 +916,25 @@ fn move_selected(ui: &Ui, special_use: SpecialUse, verb: &'static str) {
                 .find(|folder| folder.special_use == special_use)
                 .map(|folder| folder.id)
         });
-    let result = match target {
-        Some(folder) => ui.db.move_message(message, folder),
-        None => ui.db.delete_message(message),
-    };
-    if let Err(error) = result {
-        tracing::error!(%error, "failed to move message");
-    }
-    if let Some(item) = ui.selection.selected_item() {
-        if let Some(position) = ui.store.find(&item) {
-            ui.store.remove(position);
+    let locations = ui.db.thread_locations(account, &row.thread_id).unwrap_or_default();
+    let mut result = Ok(());
+    for (id, folder, _path, _uid, _flags) in locations {
+        if folder != folder_id {
+            continue;
+        }
+        result = match target {
+            Some(to) => ui.db.move_message(id, to),
+            None => ui.db.delete_message(id),
+        };
+        if result.is_err() {
+            break;
         }
     }
-    let count = ui.selection.n_items();
-    if count > 0 && filter_position != u32::MAX {
-        ui.selection.set_selected(filter_position.min(count - 1));
+    if let Err(error) = result {
+        tracing::error!(%error, "failed to move conversation");
     }
-    ui.status_label.set_text(&format!("{verb} message"));
+    ui.reload_messages();
+    ui.status_label.set_text(&format!("{verb} conversation"));
 }
 
 /// Open a conversation in a standalone window.
@@ -730,7 +985,7 @@ fn open_message_window(ui: &Ui, row: &MessageRow) {
     window.add_controller(controller);
     window.present();
 
-    mark_read_by_id(ui, row.id);
+    mark_thread_read(ui, row);
 }
 
 /// Palette injected into HTML bodies so they match the active GTK theme.
@@ -807,10 +1062,13 @@ fn conversation_message_widgets(
             &row.date_label,
             &row.snippet,
             None,
+            None,
+            &[],
             theme,
             ready,
         )];
     }
+    let senders = sender_by_message_id(&messages);
     messages
         .iter()
         .map(|message| {
@@ -822,11 +1080,15 @@ fn conversation_message_widgets(
                 ),
                 None => (message.snippet.clone(), None),
             };
+            let reply_to = reply_to_name(&senders, &message.in_reply_to);
+            let attachments = db.attachments(message.id).unwrap_or_default();
             conversation_message(
                 message.from.display(),
                 &format_timestamp(message.date.unix_timestamp()),
                 &text,
                 html.as_deref(),
+                reply_to.as_deref(),
+                &attachments,
                 theme,
                 ready,
             )
@@ -834,11 +1096,14 @@ fn conversation_message_widgets(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conversation_message(
     sender: &str,
     date: &str,
     body: &str,
     html: Option<&str>,
+    reply_to: Option<&str>,
+    attachments: &[Attachment],
     theme: &HtmlTheme,
     ready: Option<&PreviewReady>,
 ) -> gtk::Widget {
@@ -863,6 +1128,14 @@ fn conversation_message(
     head.append(&when);
 
     root.append(&head);
+    if let Some(name) = reply_to {
+        let reply = gtk::Label::new(Some(&format!("↳ in reply to {name}")));
+        reply.set_xalign(0.0);
+        reply.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        reply.add_css_class("dim-label");
+        reply.add_css_class("caption");
+        root.append(&reply);
+    }
     match html {
         Some(html) => {
             if let Some(ready) = ready {
@@ -877,6 +1150,9 @@ fn conversation_message(
             text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
             root.append(&text);
         }
+    }
+    for attachment in attachments {
+        root.append(&attachment_row(attachment));
     }
     root.upcast()
 }
@@ -895,6 +1171,7 @@ fn html_body(html: &str, theme: &HtmlTheme, ready: Option<PreviewReady>) -> gtk:
         settings.set_enable_developer_extras(false);
         settings.set_auto_load_images(false);
     }
+    install_webview_policy(&view);
     view.set_background_color(&theme.bg);
     view.set_hexpand(true);
     view.set_vexpand(false);
@@ -925,7 +1202,7 @@ fn html_body(html: &str, theme: &HtmlTheme, ready: Option<PreviewReady>) -> gtk:
             false
         });
     }
-    view.load_html(&themed_html(html, theme), None);
+    view.load_html(&themed_html(&collapse_quotes(html), theme), None);
 
     {
         let finish = finish.clone();
@@ -991,6 +1268,9 @@ img { max-width: 100%; height: auto; }
 pre, code { font-family: monospace; }
 pre { background: rgba(127,127,127,0.12); padding: 8px; border-radius: 4px; overflow-x: auto; }
 blockquote { border-left: 3px solid __ACCENT__; margin: 0; padding-left: 10px; opacity: 0.85; }
+details.quote { margin: 6px 0; }
+details.quote > summary { cursor: pointer; color: __ACCENT__; }
+details.quote blockquote { margin: 6px 0 0 0; }
 table { border-collapse: collapse; max-width: 100%; }
 th, td { border: 1px solid rgba(127,127,127,0.4); padding: 4px 8px; }
 </style>"#;
@@ -1046,4 +1326,57 @@ fn tag_name(from_lt: &str) -> Option<String> {
         .take_while(|c| c.is_ascii_alphanumeric())
         .collect();
     (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapses_a_blockquote_behind_details() {
+        let html = "<p>hi</p><blockquote type=\"cite\">old text</blockquote><p>bye</p>";
+        let out = collapse_quotes(html);
+        assert!(out.contains("<details class=\"quote\"><summary>Show quoted text</summary>"));
+        assert!(out.contains("<blockquote type=\"cite\">old text</blockquote></details>"));
+        assert!(out.contains("<p>hi</p>"));
+        assert!(out.contains("<p>bye</p>"));
+    }
+
+    #[test]
+    fn only_the_outer_blockquote_is_collapsed() {
+        let html = "<blockquote>outer<blockquote>inner</blockquote></blockquote>";
+        let out = collapse_quotes(html);
+        assert_eq!(out.matches("<details").count(), 1);
+        assert_eq!(out.matches("</details>").count(), 1);
+    }
+
+    #[test]
+    fn leaves_html_without_quotes_alone() {
+        let html = "<p>just text</p>";
+        assert_eq!(collapse_quotes(html), html);
+    }
+
+    #[test]
+    fn folds_quoted_text_lines() {
+        let text = "Hello\n> previous message\n> second line\nRegards\n";
+        let out = text_body_html(text);
+        assert!(out.contains("Hello"));
+        assert!(out.contains("Regards"));
+        assert_eq!(out.matches("<details").count(), 1);
+        assert!(out.contains("previous message"));
+    }
+
+    #[test]
+    fn plain_text_without_quotes_is_a_single_pre() {
+        let out = text_body_html("just a line\n");
+        assert_eq!(out.matches("<pre").count(), 1);
+        assert!(!out.contains("<details"));
+    }
+
+    #[test]
+    fn formats_attachment_sizes() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(2048), "2.0 KB");
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
+    }
 }

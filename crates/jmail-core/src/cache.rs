@@ -17,10 +17,20 @@ use time::OffsetDateTime;
 use crate::account::{Account, AccountId, AuthKind, Provider, Security};
 use crate::error::{Error, Result};
 use crate::folder::{Folder, FolderId, SpecialUse};
-use crate::message::{Address, Flags, Message, MessageBody, MessageId, NewMessage};
+use crate::message::{Address, Attachment, Flags, Message, MessageBody, MessageId, NewMessage};
 
 /// Bump when the schema changes and add a matching migration step.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
+
+/// A conversation as shown in the unified inbox: the latest message plus
+/// aggregate counts.
+#[derive(Debug, Clone)]
+pub struct ThreadSummary {
+    pub message: Message,
+    pub count: u32,
+    pub unread: u32,
+    pub starred: u32,
+}
 
 /// Handle to the on-disk SQLite cache. Cheap to clone; all clones share one
 /// connection.
@@ -77,6 +87,12 @@ impl Db {
         }
         if version < 2 {
             conn.execute_batch(SCHEMA_V2).map_err(storage)?;
+        }
+        if version < 3 {
+            conn.execute_batch(SCHEMA_V3).map_err(storage)?;
+        }
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4).map_err(storage)?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(storage)?;
@@ -243,15 +259,18 @@ impl Db {
         let conn = self.lock()?;
         let to_json = serde_json::to_string(&message.to).unwrap_or_else(|_| "[]".into());
         let cc_json = serde_json::to_string(&message.cc).unwrap_or_else(|_| "[]".into());
+        let refs = message.references.join(" ");
         conn.execute(
             "INSERT INTO messages
                 (account_id, folder_id, uid, message_id, thread_id, subject,
                  from_name, from_email, to_json, cc_json, date, flags, snippet,
-                 has_attachments, body_text, body_html)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 has_attachments, body_text, body_html, in_reply_to, refs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(folder_id, uid) DO UPDATE SET
                 message_id = excluded.message_id,
                 thread_id = excluded.thread_id,
+                in_reply_to = excluded.in_reply_to,
+                refs = excluded.refs,
                 subject = excluded.subject,
                 from_name = excluded.from_name,
                 from_email = excluded.from_email,
@@ -280,6 +299,8 @@ impl Db {
                 message.has_attachments as i64,
                 message.body_text,
                 message.body_html,
+                message.in_reply_to,
+                refs,
             ],
         )
         .map_err(storage)?;
@@ -326,6 +347,133 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage)?;
         Ok(rows)
+    }
+
+    /// One row per conversation in the unified inbox: the latest message plus
+    /// aggregate counts.
+    pub fn unified_inbox_threads(&self, limit: u32) -> Result<Vec<ThreadSummary>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "WITH ranked AS (
+                    SELECT {MESSAGE_COLUMNS},
+                           ROW_NUMBER() OVER (PARTITION BY m.account_id, m.thread_id
+                                              ORDER BY m.date DESC, m.id DESC) AS rn,
+                           COUNT(*) OVER (PARTITION BY m.account_id, m.thread_id) AS total,
+                           SUM(CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END)
+                               OVER (PARTITION BY m.account_id, m.thread_id) AS unread,
+                           SUM(CASE WHEN (m.flags & 4) != 0 THEN 1 ELSE 0 END)
+                               OVER (PARTITION BY m.account_id, m.thread_id) AS starred
+                    FROM messages m
+                    JOIN folders f ON f.id = m.folder_id
+                    WHERE f.special_use = ?1
+                 )
+                 SELECT * FROM ranked WHERE rn = 1 ORDER BY date DESC, id DESC LIMIT ?2"
+            ))
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![SpecialUse::Inbox.to_i64(), limit], |row| {
+                Ok(ThreadSummary {
+                    message: map_message(row)?,
+                    count: row.get::<_, i64>(18)? as u32,
+                    unread: row.get::<_, i64>(19)? as u32,
+                    starred: row.get::<_, i64>(20)? as u32,
+                })
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        Ok(rows)
+    }
+
+    /// Every message in a conversation with its server location:
+    /// `(id, folder, path, uid, flags)`, oldest first.
+    pub fn thread_locations(
+        &self,
+        account: AccountId,
+        thread_id: &str,
+    ) -> Result<Vec<(MessageId, FolderId, String, u32, Flags)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, m.folder_id, f.path, m.uid, m.flags
+                 FROM messages m JOIN folders f ON f.id = m.folder_id
+                 WHERE m.account_id = ?1 AND m.thread_id = ?2
+                 ORDER BY m.date ASC, m.id ASC",
+            )
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![account.0, thread_id], |row| {
+                Ok((
+                    MessageId(row.get(0)?),
+                    FolderId(row.get(1)?),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u32,
+                    Flags::from_i64(row.get(4)?),
+                ))
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        Ok(rows)
+    }
+
+    /// Set or clear `\Seen` on every message in a conversation. Returns the
+    /// affected ids.
+    pub fn set_thread_seen(
+        &self,
+        account: AccountId,
+        thread_id: &str,
+        seen: bool,
+    ) -> Result<Vec<MessageId>> {
+        self.set_thread_bit(account, thread_id, Flags::SEEN, seen)
+    }
+
+    /// Set or clear `\Flagged` on every message in a conversation.
+    pub fn set_thread_flagged(
+        &self,
+        account: AccountId,
+        thread_id: &str,
+        flagged: bool,
+    ) -> Result<Vec<MessageId>> {
+        self.set_thread_bit(account, thread_id, Flags::FLAGGED, flagged)
+    }
+
+    fn set_thread_bit(
+        &self,
+        account: AccountId,
+        thread_id: &str,
+        bit: i64,
+        value: bool,
+    ) -> Result<Vec<MessageId>> {
+        let ids: Vec<MessageId> = {
+            let conn = self.lock()?;
+            let mut stmt = conn
+                .prepare("SELECT id FROM messages WHERE account_id = ?1 AND thread_id = ?2")
+                .map_err(storage)?;
+            let rows = stmt
+                .query_map(params![account.0, thread_id], |row| {
+                    Ok(MessageId(row.get(0)?))
+                })
+                .map_err(storage)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage)?;
+            rows
+        };
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        let sql = if value {
+            format!("UPDATE messages SET flags = flags | {bit} WHERE id = ?1")
+        } else {
+            format!("UPDATE messages SET flags = flags & ~{bit} WHERE id = ?1")
+        };
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql).map_err(storage)?;
+        for id in &ids {
+            stmt.execute(params![id.0]).map_err(storage)?;
+        }
+        Ok(ids)
     }
 
     /// Full-text search across subject, sender and body.
@@ -406,6 +554,65 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage)?;
         Ok(rows)
+    }
+
+    /// Recompute `thread_id` for every message in an account from the cached
+    /// `Message-ID`/`In-Reply-To`/`References` graph. Returns the number of rows
+    /// whose conversation changed.
+    pub fn rethread_account(&self, account: AccountId) -> Result<usize> {
+        let inputs: Vec<crate::threading::ThreadInput> = {
+            let conn = self.lock()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, message_id, in_reply_to, refs, subject
+                     FROM messages WHERE account_id = ?1",
+                )
+                .map_err(storage)?;
+            let rows = stmt
+                .query_map(params![account.0], |row| {
+                    let refs: String = row.get(3)?;
+                    Ok(crate::threading::ThreadInput {
+                        id: row.get(0)?,
+                        message_id: row.get(1)?,
+                        in_reply_to: row.get(2)?,
+                        references: refs.split_whitespace().map(str::to_string).collect(),
+                        subject: row.get(4)?,
+                    })
+                })
+                .map_err(storage)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage)?;
+            rows
+        };
+        if inputs.is_empty() {
+            return Ok(0);
+        }
+
+        let assignment = crate::threading::assign_threads(&inputs);
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("UPDATE messages SET thread_id = ?1 WHERE id = ?2 AND thread_id <> ?1")
+            .map_err(storage)?;
+        let mut changed = 0usize;
+        for input in &inputs {
+            let Some(thread) = assignment.get(&input.id) else {
+                continue;
+            };
+            changed += stmt.execute(params![thread, input.id]).map_err(storage)?;
+        }
+        Ok(changed)
+    }
+
+    /// Recompute conversations for every account. Cheap when nothing changed
+    /// (only rows whose thread actually moved are written), so it is safe to
+    /// call on startup to heal caches written before threading existed.
+    pub fn rethread_all(&self) -> Result<usize> {
+        let accounts = self.accounts()?;
+        let mut changed = 0;
+        for account in accounts {
+            changed += self.rethread_account(account.id)?;
+        }
+        Ok(changed)
     }
 
     /// Fetch the cached body of a message, if present.
@@ -541,6 +748,66 @@ impl Db {
         )
         .map_err(storage)?;
         Ok(())
+    }
+
+    /// Replace the cached attachment metadata for a message and update its
+    /// `has_attachments` flag.
+    pub fn set_attachments(&self, id: MessageId, attachments: &[Attachment]) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM attachments WHERE message_id = ?1",
+            params![id.0],
+        )
+        .map_err(storage)?;
+        for attachment in attachments {
+            conn.execute(
+                "INSERT INTO attachments
+                    (message_id, filename, mime, size, content_id, inline, part)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id.0,
+                    attachment.filename,
+                    attachment.mime,
+                    attachment.size as i64,
+                    attachment.content_id,
+                    attachment.inline as i64,
+                    attachment.part,
+                ],
+            )
+            .map_err(storage)?;
+        }
+        conn.execute(
+            "UPDATE messages SET has_attachments = ?1 WHERE id = ?2",
+            params![(!attachments.is_empty()) as i64, id.0],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Cached attachment metadata for a message, in part order.
+    pub fn attachments(&self, id: MessageId) -> Result<Vec<Attachment>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT filename, mime, size, content_id, inline, part
+                 FROM attachments WHERE message_id = ?1 ORDER BY part, id",
+            )
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![id.0], |row| {
+                Ok(Attachment {
+                    filename: row.get(0)?,
+                    mime: row.get(1)?,
+                    size: row.get::<_, i64>(2)? as u64,
+                    content_id: row.get(3)?,
+                    inline: row.get::<_, i64>(4)? != 0,
+                    part: row.get(5)?,
+                })
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        Ok(rows)
     }
 
     /// Drop cached messages for a folder whose UIDVALIDITY changed.
@@ -727,6 +994,8 @@ impl Db {
             uid,
             message_id: format!("seed-{}-{uid}@jmail", account.0),
             thread_id: format!("seed-thread-{uid}"),
+            in_reply_to: String::new(),
+            references: Vec::new(),
             subject: subject.to_string(),
             from: Address::new(name, email),
             to: vec![Address::new("", "you@example.com")],
@@ -768,7 +1037,7 @@ fn storage(error: rusqlite::Error) -> Error {
 
 const MESSAGE_COLUMNS: &str = "m.id, m.account_id, m.folder_id, m.uid, m.message_id, \
     m.thread_id, m.subject, m.from_name, m.from_email, m.to_json, m.cc_json, \
-    m.date, m.flags, m.snippet, m.has_attachments";
+    m.date, m.flags, m.snippet, m.has_attachments, m.in_reply_to, m.refs";
 
 fn map_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account {
@@ -809,6 +1078,7 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     let to_json: String = row.get(9)?;
     let cc_json: String = row.get(10)?;
     let date: i64 = row.get(11)?;
+    let refs: String = row.get(16)?;
     Ok(Message {
         id: MessageId(row.get(0)?),
         account_id: AccountId(row.get(1)?),
@@ -827,6 +1097,8 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         flags: Flags::from_i64(row.get(12)?),
         snippet: row.get(13)?,
         has_attachments: row.get::<_, i64>(14)? != 0,
+        in_reply_to: row.get(15)?,
+        references: refs.split_whitespace().map(str::to_string).collect(),
     })
 }
 
@@ -922,6 +1194,28 @@ CREATE TABLE IF NOT EXISTS secrets (
 );
 "#;
 
+/// Threading headers: `References` is stored as space-separated message-ids
+/// (the column is named `refs` because `references` is a SQL keyword).
+const SCHEMA_V3: &str = r#"
+ALTER TABLE messages ADD COLUMN in_reply_to TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN refs TEXT NOT NULL DEFAULT '';
+"#;
+
+/// Attachment *metadata* (not the contents, which are re-fetched on demand).
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS attachments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    filename   TEXT NOT NULL DEFAULT '',
+    mime       TEXT NOT NULL DEFAULT '',
+    size       INTEGER NOT NULL DEFAULT 0,
+    content_id TEXT,
+    inline     INTEGER NOT NULL DEFAULT 0,
+    part       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,6 +1259,8 @@ mod tests {
             uid: 999,
             message_id: "m".into(),
             thread_id: "t".into(),
+            in_reply_to: String::new(),
+            references: Vec::new(),
             subject: "Hello world".into(),
             from: Address::new("Sender", "sender@example.org"),
             to: vec![],
@@ -980,6 +1276,172 @@ mod tests {
         let second = db.upsert_message(&message).unwrap();
         assert_eq!(first, second);
         assert_eq!(db.unified_inbox(100).unwrap().len(), before + 1);
+    }
+
+    #[test]
+    fn rethreads_replies_into_one_conversation() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let account = db.accounts().unwrap()[0].id;
+        let folder = db
+            .folders(account)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.special_use == SpecialUse::Inbox)
+            .unwrap()
+            .id;
+        let make = |uid: u32, message_id: &str, in_reply_to: &str, references: Vec<String>, subject: &str| {
+            NewMessage {
+                account_id: account,
+                folder_id: folder,
+                uid,
+                message_id: message_id.into(),
+                thread_id: String::new(),
+                in_reply_to: in_reply_to.into(),
+                references,
+                subject: subject.into(),
+                from: Address::new("Sender", "sender@example.org"),
+                to: vec![],
+                cc: vec![],
+                date: OffsetDateTime::now_utc(),
+                flags: Flags::default(),
+                snippet: "hi".into(),
+                has_attachments: false,
+                body_text: None,
+                body_html: None,
+            }
+        };
+        let root = db
+            .upsert_message(&make(900, "root@t", "", vec![], "Thread subject"))
+            .unwrap();
+        let reply = db
+            .upsert_message(&make(
+                901,
+                "reply@t",
+                "root@t",
+                vec!["root@t".to_string()],
+                "Re: Thread subject",
+            ))
+            .unwrap();
+
+        let changed = db.rethread_account(account).unwrap();
+        assert!(changed >= 2, "both new rows should be (re)assigned");
+        assert_eq!(db.get_message(root).unwrap().unwrap().thread_id, "root@t");
+        assert_eq!(db.get_message(reply).unwrap().unwrap().thread_id, "root@t");
+
+        let thread = db.thread_messages(account, "root@t", 10).unwrap();
+        assert_eq!(thread.len(), 2);
+        assert_eq!(thread[0].id, root);
+        assert_eq!(thread[1].id, reply);
+    }
+
+    #[test]
+    fn unified_inbox_groups_conversations_and_flags_them() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let account = db.accounts().unwrap()[0].id;
+        let folder = db
+            .folders(account)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.special_use == SpecialUse::Inbox)
+            .unwrap()
+            .id;
+        let make = |uid: u32, message_id: &str, in_reply_to: &str, seen: bool| NewMessage {
+            account_id: account,
+            folder_id: folder,
+            uid,
+            message_id: message_id.into(),
+            thread_id: String::new(),
+            in_reply_to: in_reply_to.into(),
+            references: if in_reply_to.is_empty() {
+                Vec::new()
+            } else {
+                vec![in_reply_to.to_string()]
+            },
+            subject: "Shared subject".into(),
+            from: Address::new("Sender", "sender@example.org"),
+            to: vec![],
+            cc: vec![],
+            date: OffsetDateTime::now_utc(),
+            flags: Flags {
+                seen,
+                ..Flags::default()
+            },
+            snippet: "hi".into(),
+            has_attachments: false,
+            body_text: None,
+            body_html: None,
+        };
+        db.upsert_message(&make(910, "conv-root@t", "", false)).unwrap();
+        db.upsert_message(&make(911, "conv-reply@t", "conv-root@t", true)).unwrap();
+        db.rethread_account(account).unwrap();
+
+        let thread = db
+            .unified_inbox_threads(200)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.message.thread_id == "conv-root@t")
+            .expect("conversation row");
+        assert_eq!(thread.count, 2);
+        assert_eq!(thread.unread, 1);
+        assert_eq!(thread.starred, 0);
+
+        assert_eq!(
+            db.set_thread_seen(account, "conv-root@t", true).unwrap().len(),
+            2
+        );
+        let thread = db
+            .unified_inbox_threads(200)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.message.thread_id == "conv-root@t")
+            .unwrap();
+        assert_eq!(thread.unread, 0);
+
+        db.set_thread_flagged(account, "conv-root@t", true).unwrap();
+        let thread = db
+            .unified_inbox_threads(200)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.message.thread_id == "conv-root@t")
+            .unwrap();
+        assert_eq!(thread.starred, 2);
+    }
+
+    #[test]
+    fn attachment_metadata_round_trips() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let message = db.unified_inbox(1).unwrap().remove(0);
+        assert!(db.attachments(message.id).unwrap().is_empty());
+        assert!(!db.get_message(message.id).unwrap().unwrap().has_attachments);
+
+        let attachments = vec![
+            Attachment {
+                filename: "report.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 1234,
+                content_id: None,
+                inline: false,
+                part: "0".into(),
+            },
+            Attachment {
+                filename: "logo.png".into(),
+                mime: "image/png".into(),
+                size: 42,
+                content_id: Some("logo@x".into()),
+                inline: true,
+                part: "1".into(),
+            },
+        ];
+        db.set_attachments(message.id, &attachments).unwrap();
+        assert_eq!(db.attachments(message.id).unwrap(), attachments);
+        assert!(db.get_message(message.id).unwrap().unwrap().has_attachments);
+
+        db.set_attachments(message.id, &[]).unwrap();
+        assert!(db.attachments(message.id).unwrap().is_empty());
+        assert!(!db.get_message(message.id).unwrap().unwrap().has_attachments);
     }
 
     #[test]

@@ -68,17 +68,17 @@ Cache: `~/.var/app/tech.jptr.jmail/data/jmail/cache.db`.
 
 ---
 
-## M3 — Conversations, real bodies, HTML  🚧 IN PROGRESS
+## M3 — Conversations, real bodies, HTML  ✅ DONE
 - [x] Reading pane renders cached **text** bodies; newest at bottom.
 - [x] Fetch bodies **on open**: preview sends `SyncCommand::FetchBody`; pane re-renders on `MessagesChanged` (`actions.rs ensure_body`/`reload_preview`).
 - [x] **WebKitGTK 6.0** HTML rendering (spike): `webkit6` renders `body_html` with page scripts disabled (`enable-javascript-markup=false`), images not auto-loaded, and `script`/`iframe`/`object`/`embed` stripped. Runtime already ships WebKitGTK 6.0; no extra Flatpak module.
 - [x] WebView theming: background/foreground/accent pulled from the active GTK theme and injected as CSS; re-themes live on `AdwStyleManager::dark` change.
 - [x] WebView auto-size: content height measured via `evaluate_javascript` and re-measured on width changes, so the reading pane scrolls as a whole.
-- [ ] Real threading: build `thread_id` from `References`/`In-Reply-To` (+ Gmail `X-GM-THRID`). Currently `thread_id = message_id` (one message per thread).
-- [ ] Collapse the list to one row per conversation (message-count badge); update action identity.
-- [ ] Collapse quoted text / show quoted behind an expander.
-- [ ] MIME: attachments metadata, multipart, reply attribution.
-- [ ] Link handling in HTML bodies (open externally instead of navigating the WebView).
+- [x] Real threading: `thread_id` built from `Message-ID`/`In-Reply-To`/`References` (`threading::assign_threads`, union-find + subject fallback, `Db::rethread_account`, run during sync and at startup). Gmail `X-GM-THRID` deferred to M5 — `async-imap` 0.12 does not expose the attribute.
+- [x] Collapse the list to one row per conversation (message-count badge, aggregate unread/star). Star/read/archive/delete act on the whole thread; reply/reply-all target the latest message.
+- [x] Collapse quoted text / show quoted behind an expander (`<details class="quote">`; HTML `<blockquote>` and plain-text `>` runs).
+- [x] MIME: attachment **metadata** (`attachments` table + chips: name/type/size), multipart parsing, and "in reply to" attribution. Attachment *contents* (save/open) stay in M9.
+- [x] Link handling in HTML bodies: link clicks open via `GtkUriLauncher` (OpenURI portal); navigation/`target=_blank` are blocked in the WebView.
 
 > Local `cargo run -p jmail-ui` needs the WebKitGTK dev files: `sudo dnf install webkitgtk6.0-devel javascriptcoregtk6.0-devel libsoup3-devel`. The Flatpak SDK already has them.
 

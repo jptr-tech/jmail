@@ -113,6 +113,10 @@ fn open_db() -> Db {
             tracing::error!(%error, "failed to seed demo data");
         }
     }
+    // Heal conversations for caches written before References threading existed.
+    if let Err(error) = db.rethread_all() {
+        tracing::warn!(%error, "failed to rebuild conversations");
+    }
     db
 }
 
