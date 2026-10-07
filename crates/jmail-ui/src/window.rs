@@ -40,14 +40,14 @@ pub struct Ui {
     pub preview_row: Rc<RefCell<Option<MessageRow>>>,
     /// While set, selection changes do not trigger a reading-pane preview.
     pub suppress_preview: Rc<Cell<bool>>,
-    pub reading_stack: gtk::Stack,
+    /// Shown over the reading pane until a conversation is opened.
+    pub reading_empty: adw::StatusPage,
     pub reading_subject: gtk::Label,
     pub conversation: gtk::Box,
-    /// Overlay used to preload the next conversation without disturbing the
-    /// currently displayed one.
-    pub preview_overlay: gtk::Overlay,
-    /// The in-flight conversation container mounted on `preview_overlay`.
-    pub pending_preview: Rc<RefCell<Option<gtk::Widget>>>,
+    /// Long-lived per-message body cells. Each cell's WebView is created once
+    /// and reused for later messages so WebKit's compositing surface is never
+    /// torn down and re-created.
+    pub cells: Rc<RefCell<Vec<crate::actions::MessageCell>>>,
     pub search_bar: gtk::SearchBar,
     pub search_entry: gtk::SearchEntry,
     pub search_toggle: gtk::ToggleButton,
@@ -171,11 +171,10 @@ impl Ui {
             preview_generation,
             preview_row: Rc::new(RefCell::new(None)),
             suppress_preview: Rc::new(Cell::new(false)),
-            reading_stack: reading.stack,
+            reading_empty: reading.empty,
             reading_subject: reading.subject,
             conversation: reading.conversation,
-            preview_overlay: reading.overlay,
-            pending_preview: Rc::new(RefCell::new(None)),
+            cells: Rc::new(RefCell::new(Vec::new())),
             search_bar,
             search_entry,
             search_toggle,
@@ -382,15 +381,23 @@ impl Ui {
                 crate::actions::reload_preview(&ui);
             });
         }
+        // Warm up the reading pane's reusable WebView whenever it becomes
+        // visible (at launch, or when the pane is first shown in the narrow
+        // layout) so the first conversation avoids the cold-start black frame.
+        {
+            let ui = self.clone();
+            self.conversation.connect_map(move |_| {
+                crate::actions::preload_reading_pane(&ui);
+            });
+        }
     }
 }
 
 struct ReadingPane {
     root: gtk::Widget,
-    stack: gtk::Stack,
+    empty: adw::StatusPage,
     subject: gtk::Label,
     conversation: gtk::Box,
-    overlay: gtk::Overlay,
 }
 
 fn build_header() -> (adw::HeaderBar, gtk::ToggleButton, adw::WindowTitle) {
@@ -641,6 +648,11 @@ fn build_reading_pane(status_label: &gtk::Label) -> ReadingPane {
         .description("Choose a message to read it here. Conversations are shown oldest first, newest at the bottom.")
         .vexpand(true)
         .build();
+    // Opaque so the pre-warmed (and initially black) body WebView mounted behind
+    // it is never visible while it paints for the first time.
+    empty.add_css_class("reading-empty");
+    empty.set_hexpand(true);
+    empty.set_vexpand(true);
 
     let subject = gtk::Label::new(None);
     subject.set_xalign(0.0);
@@ -654,14 +666,8 @@ fn build_reading_pane(status_label: &gtk::Label) -> ReadingPane {
     let conversation = gtk::Box::new(Orientation::Vertical, 0);
     conversation.set_valign(Align::Start);
 
-    // While a new conversation loads, it is mounted as an overlay child at zero
-    // opacity so it renders off-screen; once ready it is swapped into
-    // `conversation`, keeping the previous message visible until then.
-    let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&conversation));
-
     let scrolled = gtk::ScrolledWindow::builder()
-        .child(&overlay)
+        .child(&conversation)
         .vexpand(true)
         .build();
 
@@ -670,11 +676,13 @@ fn build_reading_pane(status_label: &gtk::Label) -> ReadingPane {
     conversation_page.append(&gtk::Separator::new(Orientation::Horizontal));
     conversation_page.append(&scrolled);
 
-    let stack = gtk::Stack::new();
-    stack.add_named(&empty, Some("empty"));
-    stack.add_named(&conversation_page, Some("conversation"));
-    stack.set_visible_child_name("empty");
-    stack.set_vexpand(true);
+    // The conversation page stays mounted (and mapped) behind the empty state,
+    // so a preloaded body WebView can warm up its compositing surface before the
+    // first conversation is opened.
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&conversation_page));
+    overlay.add_overlay(&empty);
+    overlay.set_vexpand(true);
 
     let footer = gtk::Box::new(Orientation::Horizontal, 0);
     footer.set_margin_top(6);
@@ -684,15 +692,14 @@ fn build_reading_pane(status_label: &gtk::Label) -> ReadingPane {
     footer.append(status_label);
 
     let root = gtk::Box::new(Orientation::Vertical, 0);
-    root.append(&stack);
+    root.append(&overlay);
     root.append(&gtk::Separator::new(Orientation::Horizontal));
     root.append(&footer);
 
     ReadingPane {
         root: root.upcast(),
-        stack,
+        empty,
         subject,
         conversation,
-        overlay,
     }
 }

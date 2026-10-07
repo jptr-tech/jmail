@@ -260,78 +260,243 @@ fn begin_preview(ui: &Ui, row: &MessageRow, show_content: bool) {
 fn render_preview(ui: &Ui, row: &MessageRow) {
     let theme = html_theme(&ui.conversation);
     ui.reading_subject.set_label(&row.subject);
-    ui.reading_stack.set_visible_child_name("conversation");
+    ui.reading_empty.set_visible(false);
 
-    let generation = ui.preview_generation.get();
+    let data = thread_render_data(&ui.db, row);
 
-    // Drop any conversation still preloading from a previous selection.
-    if let Some(pending) = ui.pending_preview.borrow_mut().take() {
-        ui.preview_overlay.remove_overlay(&pending);
+    // Reuse the same long-lived cell (and WebView) for each message slot. New
+    // cells are only created the first time a thread is deeper than any we have
+    // rendered before; they are never destroyed, so WebKit's compositing
+    // surface is never torn down and re-created.
+    let mut cells = ui.cells.borrow_mut();
+    while cells.len() < data.len() {
+        let cell = MessageCell::new(&theme);
+        ui.conversation.append(&cell.root);
+        cells.push(cell);
     }
-
-    // If something is already on screen, build the next conversation off to the
-    // side and only swap it in once it has rendered.
-    let keep_previous = ui.conversation.first_child().is_some();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.set_valign(gtk::Align::Start);
-
-    if !keep_previous {
-        // No previous view: render straight into the visible pane.
-        while let Some(child) = ui.conversation.first_child() {
-            ui.conversation.remove(&child);
-        }
-        for widget in conversation_message_widgets(&ui.db, &theme, None, row) {
-            ui.conversation.append(&widget);
-        }
-        return;
+    for (cell, message) in cells.iter().zip(data.iter()) {
+        cell.root.set_visible(true);
+        cell.load(message, &theme);
     }
+    for cell in cells.iter().skip(data.len()) {
+        cell.root.set_visible(false);
+    }
+}
 
-    content.set_opacity(0.0);
-    ui.preview_overlay.add_overlay(&content);
-    *ui.pending_preview.borrow_mut() = Some(content.clone().upcast());
+/// The bits of one message the reading pane needs to render.
+struct RenderedMessage {
+    id: i64,
+    has_body: bool,
+    sender: String,
+    date: String,
+    text: String,
+    html: Option<String>,
+}
 
-    let swapped = Rc::new(std::cell::Cell::new(false));
-    let swap: Rc<dyn Fn()> = {
-        let ui = ui.clone();
-        let content = content.clone();
-        let swapped = swapped.clone();
-        Rc::new(move || {
-            if swapped.replace(true) {
-                return;
+/// Build render data for every message in `row`'s conversation, oldest first.
+fn thread_render_data(db: &Db, row: &MessageRow) -> Vec<RenderedMessage> {
+    let messages = db
+        .thread_messages(AccountId(row.account_id), &row.thread_id, 50)
+        .unwrap_or_default();
+    if messages.is_empty() {
+        return vec![RenderedMessage {
+            id: row.id,
+            has_body: false,
+            sender: row.sender.clone(),
+            date: row.date_label.clone(),
+            text: row.snippet.clone(),
+            html: None,
+        }];
+    }
+    messages
+        .iter()
+        .map(|message| {
+            let body = db.message_body(message.id).ok().flatten();
+            let has_body = body
+                .as_ref()
+                .map(|body| body.text.is_some() || body.html.is_some())
+                .unwrap_or(false);
+            let (text, html) = match body {
+                Some(body) => (
+                    body.text.unwrap_or_else(|| message.snippet.clone()),
+                    body.html,
+                ),
+                None => (message.snippet.clone(), None),
+            };
+            RenderedMessage {
+                id: message.id.0,
+                has_body,
+                sender: message.from.display().to_string(),
+                date: format_timestamp(message.date.unix_timestamp()),
+                text,
+                html,
             }
-            // A newer preview superseded this one; it will clean us up.
-            if ui.preview_generation.get() != generation {
-                return;
-            }
-            while let Some(child) = ui.conversation.first_child() {
-                ui.conversation.remove(&child);
-            }
-            while let Some(child) = content.first_child() {
-                content.remove(&child);
-                ui.conversation.append(&child);
-            }
-            ui.preview_overlay.remove_overlay(&content);
-            *ui.pending_preview.borrow_mut() = None;
         })
-    };
+        .collect()
+}
 
-    let ready = PreviewReady {
-        remaining: Rc::new(std::cell::Cell::new(0)),
-        notify: swap.clone(),
-    };
-    for widget in conversation_message_widgets(&ui.db, &theme, Some(&ready), row) {
-        content.append(&widget);
-    }
-    // Nothing to wait for (no HTML bodies): swap right away.
-    if ready.remaining.get() == 0 {
-        (ready.notify)();
+/// A message cell whose body WebView is created once and then reused.
+pub(crate) struct MessageCell {
+    root: gtk::Box,
+    who: gtk::Label,
+    when: gtk::Label,
+    view: webkit6::WebView,
+    /// `(message id, body available, dark theme)` of the content currently
+    /// loaded, so a redundant `reload_preview` (e.g. after a flag change) does
+    /// not repaint the body.
+    last: std::cell::RefCell<Option<(i64, bool, bool)>>,
+}
+
+impl MessageCell {
+    fn new(theme: &HtmlTheme) -> Self {
+        use webkit6::prelude::*;
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        root.set_margin_top(10);
+        root.set_margin_bottom(10);
+        root.set_margin_start(14);
+        root.set_margin_end(14);
+        root.add_css_class("conversation-message");
+
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let who = gtk::Label::new(None);
+        who.set_xalign(0.0);
+        who.add_css_class("heading");
+        let when = gtk::Label::new(None);
+        when.add_css_class("dim-label");
+        when.add_css_class("caption");
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        head.append(&who);
+        head.append(&spacer);
+        head.append(&when);
+        root.append(&head);
+
+        let view = webkit6::WebView::new();
+        if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
+            settings.set_enable_javascript(true);
+            settings.set_enable_javascript_markup(false);
+            settings.set_enable_developer_extras(false);
+            settings.set_auto_load_images(false);
+        }
+        view.set_background_color(&theme.bg);
+        view.set_hexpand(true);
+        view.set_vexpand(false);
+        view.set_size_request(-1, 140);
+        // Keep the (reused) surface hidden until it has painted its content.
+        view.set_opacity(0.0);
+
+        {
+            let view = view.clone();
+            view.connect_load_changed(move |view, event| {
+                if event == webkit6::LoadEvent::Finished {
+                    measure_view_height(view);
+                    view.set_opacity(1.0);
+                }
+            });
+        }
+        {
+            let view = view.clone();
+            view.connect_load_failed(move |view, _, _, _| {
+                view.set_opacity(1.0);
+                false
+            });
+        }
+        // Re-measure whenever the allocated width changes (the pane was resized).
+        let last_width = Rc::new(std::cell::Cell::new(0));
+        view.add_tick_callback(move |view, _clock| {
+            let width = view.width();
+            if width != last_width.get() {
+                last_width.set(width);
+                measure_view_height(view);
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+
+        root.append(&view);
+        Self {
+            root,
+            who,
+            when,
+            view,
+            last: std::cell::RefCell::new(None),
+        }
     }
 
-    // Backstop: swap even if some view never reports ready.
-    {
-        let swap = swap.clone();
-        gtk::glib::timeout_add_local_once(Duration::from_secs(1), move || swap());
+    /// Point this cell at a different message; the WebView is reused as-is.
+    fn load(&self, message: &RenderedMessage, theme: &HtmlTheme) {
+        let key = (message.id, message.has_body, theme.dark);
+        if self.last.borrow().as_ref() == Some(&key) {
+            return;
+        }
+        *self.last.borrow_mut() = Some(key);
+
+        self.who.set_text(&message.sender);
+        self.when.set_text(&message.date);
+
+        let html = match &message.html {
+            Some(html) => themed_html(html, theme),
+            None => themed_html(
+                &format!(
+                    "<pre style=\"white-space: pre-wrap; overflow-wrap: anywhere; margin: 0;\">{}</pre>",
+                    escape_html(&message.text)
+                ),
+                theme,
+            ),
+        };
+        self.load_html(&html, theme);
     }
+
+    /// Load a blank themed page so WebKit creates and paints its compositing
+    /// surface before the first real message arrives. A real message is never
+    /// clobbered; a warm-up page is marked by `id = -1` in the `last` guard.
+    fn warm(&self, theme: &HtmlTheme) {
+        let showing_message = self
+            .last
+            .borrow()
+            .as_ref()
+            .map(|(id, _, _)| *id >= 0)
+            .unwrap_or(false);
+        if showing_message {
+            return;
+        }
+        // The empty state above is opaque, so this render is never visible, but
+        // it still primes WebKit's compositing surface for the first message.
+        *self.last.borrow_mut() = Some((-1, false, theme.dark));
+        self.load_html(&themed_html("", theme), theme);
+    }
+
+    /// Render new HTML while hidden, then reveal it once it has painted.
+    fn load_html(&self, html: &str, theme: &HtmlTheme) {
+        use webkit6::prelude::*;
+
+        self.view.set_background_color(&theme.bg);
+        self.view.set_opacity(0.0);
+        self.view.load_html(html, None);
+        // Backstop so a load that never reports finished still appears.
+        let view = self.view.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_secs(1), move || view.set_opacity(1.0));
+    }
+}
+
+/// Ensure the reading pane's reusable WebView exists and has painted once, so
+/// the first conversation opened does not cold-start WebKit on screen.
+pub(crate) fn preload_reading_pane(ui: &Ui) {
+    let theme = html_theme(&ui.conversation);
+    let mut cells = ui.cells.borrow_mut();
+    if cells.is_empty() {
+        let cell = MessageCell::new(&theme);
+        ui.conversation.append(&cell.root);
+        cells.push(cell);
+    }
+    cells[0].warm(&theme);
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Re-render the reading pane (e.g. after a body finished fetching).
@@ -767,15 +932,13 @@ fn html_body(html: &str, theme: &HtmlTheme, ready: Option<PreviewReady>) -> gtk:
         view.connect_load_changed(move |view, event| {
             if event == webkit6::LoadEvent::Finished {
                 measure_view_height(view);
-                // `Finished` only means the load completed; wait until the page
-                // can be rasterized (snapshot succeeds) before revealing.
+                // `Finished` only means the load completed; wait for the next
+                // frame tick so WebKit has actually painted before revealing.
                 let finish = finish.clone();
-                view.snapshot(
-                    webkit6::SnapshotRegion::Visible,
-                    webkit6::SnapshotOptions::NONE,
-                    None::<&gtk::gio::Cancellable>,
-                    move |_result| finish(),
-                );
+                view.add_tick_callback(move |_, _| {
+                    finish();
+                    gtk::glib::ControlFlow::Break
+                });
             }
         });
     }

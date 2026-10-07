@@ -39,3 +39,8 @@
 .conversation-message {
   border-bottom: 1px solid alpha(@borders, 0.5);
 }
+
+/* Opaque empty state: covers the warm-up WebView while it primes its surface. */
+.reading-empty {
+  background-color: @window_bg_color;
+}
