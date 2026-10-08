@@ -7,6 +7,7 @@ use crate::account::AccountId;
 use crate::folder::FolderId;
 use crate::message::MessageId;
 use crate::outgoing::DraftRef;
+use std::path::PathBuf;
 
 /// Something that happened in the background that the UI may want to reflect.
 #[derive(Debug, Clone)]
@@ -25,6 +26,13 @@ pub enum Event {
     BodyLoaded {
         account: AccountId,
         message: MessageId,
+    },
+    /// An attachment finished saving to disk (or failed).
+    AttachmentSaved {
+        message: MessageId,
+        part: u32,
+        path: PathBuf,
+        error: Option<String>,
     },
     /// A new message arrived in the Inbox and should be considered for a
     /// desktop notification.

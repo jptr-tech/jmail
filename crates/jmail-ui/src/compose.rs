@@ -427,6 +427,17 @@ impl Composer {
 
 /// Open the composer in a modal dialog (new message / draft editing).
 pub fn present(ui: &Ui, mode: Mode, target: Option<MessageId>) {
+    present_in(&ui.window, ui, mode, target);
+}
+
+/// Open the composer in a dialog parented to `parent` — the main window, or a
+/// detached message window.
+pub fn present_in(
+    parent: &impl IsA<gtk::Widget>,
+    ui: &Ui,
+    mode: Mode,
+    target: Option<MessageId>,
+) {
     let accounts = ui.db.accounts().unwrap_or_default();
     if !accounts.iter().any(|account| account.enabled) {
         ui.status_label.set_text("Add an account before composing");
@@ -489,44 +500,61 @@ pub fn present(ui: &Ui, mode: Mode, target: Option<MessageId>) {
         });
     }
 
-    dialog.present(Some(&ui.window));
+    dialog.present(Some(parent));
 }
 
-/// Open the composer inline at the bottom of the reading pane.
-pub fn present_inline(ui: &Ui, mode: Mode, target: Option<MessageId>) {
+/// Open the composer inline at the bottom of a reading pane.
+pub fn present_inline(
+    ui: &Ui,
+    pane: &Rc<crate::actions::ReadingPane>,
+    mode: Mode,
+    target: Option<MessageId>,
+) {
     let accounts = ui.db.accounts().unwrap_or_default();
     if !accounts.iter().any(|account| account.enabled) {
         ui.status_label.set_text("Add an account before composing");
         return;
     }
-    ui.clear_inline();
+    pane.clear_inline(ui);
     let target = target.and_then(|id| ui.db.get_message(id).ok().flatten());
     let composer = Composer::new(ui, mode, target, true);
     composer.wire(ui);
-    ui.set_inline_composer(composer.id);
+    pane.set_inline_composer(composer.id);
 
     {
         let ui = ui.clone();
         let composer = composer.clone();
+        let pane = pane.clone();
         ui.clone().register_compose_handler(
             composer.id,
-            Rc::new(move |outcome| composer.handle_outcome(&ui, outcome)),
+            Rc::new(move |outcome| {
+                if let ComposeOutcome::Send { error: None } = &outcome {
+                    pane.clear_inline(&ui);
+                    ui.unregister_compose(composer.id);
+                    ui.status_label.set_text("Message sent");
+                    ui.reload_messages();
+                    crate::actions::reload_preview(&ui);
+                    return;
+                }
+                composer.handle_outcome(&ui, outcome);
+            }),
         );
     }
 
     let discard = gtk::Button::with_label("Discard");
     {
         let ui = ui.clone();
-        discard.connect_clicked(move |_| ui.clear_inline());
+        let pane = pane.clone();
+        discard.connect_clicked(move |_| pane.clear_inline(&ui));
     }
     composer
         .actions
         .insert_child_after(&discard, Some(&composer.preview));
 
-    ui.compose_slot.append(&composer.root);
-    ui.reply_bar.set_visible(false);
+    pane.compose_slot.append(&composer.root);
+    pane.reply_bar.set_visible(false);
     composer.focus_editor();
-    ui.scroll_reading_to_bottom();
+    pane.scroll_to_bottom();
 }
 
 fn display_address_list(addresses: &[Address]) -> String {

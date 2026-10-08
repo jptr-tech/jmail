@@ -33,4 +33,4 @@ pub use outgoing::{
     sanitize_header, select_reply_target, DraftRef, OutgoingAttachment, OutgoingMessage,
 };
 pub use smtp::SmtpSettings;
-pub use sync::{SyncCommand, SyncEngine};
+pub use sync::{MoveTarget, SyncCommand, SyncEngine};

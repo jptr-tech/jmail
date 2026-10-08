@@ -547,6 +547,94 @@ impl Db {
         Ok(rows)
     }
 
+    /// Conversations with at least one message matching a full-text `query`,
+    /// across all cached mail. The representative message and count/unread/
+    /// starred describe the whole conversation. Empty when the query is blank.
+    pub fn search_threads(&self, query: &str, limit: u32) -> Result<Vec<ThreadSummary>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(match_query) = fts_query(query) {
+            if let Ok(rows) = self.search_threads_sql(
+                "JOIN messages_fts fts ON fts.rowid = m.id WHERE messages_fts MATCH ?1",
+                match_query,
+                limit,
+            ) {
+                return Ok(rows);
+            }
+        }
+        // Fallback: LIKE over subject and sender, like `Db::search`.
+        let like = format!("%{query}%");
+        self.search_threads_sql(
+            "WHERE m.subject LIKE ?1 OR m.from_name LIKE ?1 OR m.from_email LIKE ?1",
+            like,
+            limit,
+        )
+    }
+
+    fn search_threads_sql(
+        &self,
+        matched_sql: &str,
+        param: String,
+        limit: u32,
+    ) -> Result<Vec<ThreadSummary>> {
+        let sql = format!(
+            "WITH matched AS (
+                    SELECT DISTINCT m.account_id AS account_id, m.thread_id AS thread_id
+                    FROM messages m
+                    {matched_sql}
+                 ),
+                 filtered AS (
+                    SELECT {MESSAGE_COLUMNS}, f.special_use AS folder_special
+                    FROM messages m
+                    JOIN folders f ON f.id = m.folder_id
+                    JOIN accounts a ON a.id = m.account_id AND a.enabled = 1
+                    JOIN matched mt ON mt.account_id = m.account_id AND mt.thread_id = m.thread_id
+                 ),
+                 deduped AS (
+                    SELECT m.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY m.account_id,
+                                   CASE WHEN m.message_id = '' THEN 'id:' || m.id ELSE m.message_id END
+                               ORDER BY (m.folder_special = ?2) DESC, m.id ASC
+                           ) AS dedup_rn
+                    FROM filtered m
+                 ),
+                 ranked AS (
+                    SELECT {MESSAGE_COLUMNS},
+                           ROW_NUMBER() OVER (PARTITION BY m.account_id, m.thread_id
+                                              ORDER BY m.date DESC, m.id DESC) AS rn,
+                           COUNT(*) OVER (PARTITION BY m.account_id, m.thread_id) AS total,
+                           SUM(CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END)
+                               OVER (PARTITION BY m.account_id, m.thread_id) AS unread,
+                           SUM(CASE WHEN (m.flags & 4) != 0 THEN 1 ELSE 0 END)
+                               OVER (PARTITION BY m.account_id, m.thread_id) AS starred
+                    FROM deduped m
+                    WHERE m.dedup_rn = 1
+                 )
+                 SELECT * FROM ranked WHERE rn = 1 ORDER BY date DESC, id DESC LIMIT ?3"
+        );
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql).map_err(storage)?;
+        let rows = stmt
+            .query_map(
+                params![param, SpecialUse::Inbox.to_i64(), limit],
+                |row| {
+                    Ok(ThreadSummary {
+                        message: map_message(row)?,
+                        count: row.get::<_, i64>(19)? as u32,
+                        unread: row.get::<_, i64>(20)? as u32,
+                        starred: row.get::<_, i64>(21)? as u32,
+                    })
+                },
+            )
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        Ok(rows)
+    }
+
     /// Every message in a conversation with its server location:
     /// `(id, folder, path, uid, flags)`, oldest first.
     pub fn thread_locations(
@@ -1764,6 +1852,54 @@ mod tests {
         let results = db.search("compiler", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].subject.contains("Compiler"));
+    }
+
+    #[test]
+    fn search_threads_groups_matches() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let account = db.accounts().unwrap()[0].id;
+        let inbox = db
+            .folders(account)
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.special_use == SpecialUse::Inbox)
+            .unwrap();
+        for uid in [900, 901] {
+            db.upsert_message(&NewMessage {
+                account_id: account,
+                folder_id: inbox.id,
+                uid,
+                message_id: format!("zebra-{uid}@x"),
+                thread_id: "zebra-thread".to_string(),
+                in_reply_to: String::new(),
+                references: Vec::new(),
+                subject: format!("Zebra report {uid}"),
+                from: Address::new("Zoe", "zoe@example.org"),
+                to: vec![Address::new("", "you@example.com")],
+                cc: Vec::new(),
+                reply_to: Vec::new(),
+                date: OffsetDateTime::now_utc(),
+                flags: Flags {
+                    seen: true,
+                    ..Flags::default()
+                },
+                snippet: String::new(),
+                has_attachments: false,
+                body_text: None,
+                body_html: None,
+            })
+            .unwrap();
+        }
+
+        let threads = db.search_threads("zebra", 10).unwrap();
+        assert_eq!(threads.len(), 1, "both messages collapse into one conversation");
+        assert_eq!(threads[0].count, 2);
+        assert_eq!(threads[0].message.thread_id, "zebra-thread");
+
+        // The LIKE fallback also finds the conversation by sender.
+        let by_sender = db.search_threads("Zoe", 10).unwrap();
+        assert!(by_sender.iter().any(|t| t.message.thread_id == "zebra-thread"));
     }
 
     #[test]

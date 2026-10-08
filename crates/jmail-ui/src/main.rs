@@ -4,6 +4,7 @@ mod context;
 mod keys;
 mod markdown_editor;
 mod message_row;
+mod prefs;
 mod settings;
 mod util;
 mod welcome;

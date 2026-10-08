@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use jmail_core::imap::{ImapSession, ImapSettings, TlsTrust};
 use jmail_core::message::Flags;
-use jmail_core::{Account, Db, Security, SpecialUse, SyncCommand, SyncEngine};
+use jmail_core::{Account, Db, MoveTarget, Security, SpecialUse, SyncCommand, SyncEngine};
 use jmail_mock_imap::{MockConfig, MockMailbox, MockMessage, MockServer};
 
 fn settings(port: u16, security: Security) -> ImapSettings {
@@ -395,6 +395,81 @@ async fn engine_syncs_into_cache_and_applies_moves() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_moves_thread_to_named_folder() {
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let folders = db.folders(account).unwrap();
+    let inbox = folders
+        .iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let projects = folders
+        .iter()
+        .find(|folder| folder.name == "Projects")
+        .expect("mock has a Projects folder");
+    let report = db
+        .messages_in_folder(inbox.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.subject == "Quarterly report")
+        .expect("quarterly report in inbox");
+
+    engine.send(
+        account,
+        SyncCommand::MoveThread {
+            message: report.id,
+            to: MoveTarget::Folder(projects.id),
+        },
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::MessagesChanged { .. })
+            && db.get_message(report.id).unwrap().is_none()
+        {
+            break;
+        }
+    }
+    assert!(
+        db.get_message(report.id).unwrap().is_none(),
+        "moved message should leave the inbox cache"
+    );
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_applies_thread_wide_flags() {
     let server = start_server(false).await;
     let db = Db::open_in_memory().unwrap();
@@ -588,6 +663,81 @@ async fn engine_extracts_attachment_metadata() {
         .as_deref()
         .unwrap_or("")
         .contains("Attached is the quarterly report."));
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_saves_attachment_to_disk() {
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let inbox = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let report = db
+        .messages_in_folder(inbox.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.subject == "Quarterly report")
+        .unwrap();
+
+    let destination = std::env::temp_dir().join(format!(
+        "jmail-attachment-{}.pdf",
+        std::process::id()
+    ));
+    engine.send(
+        account,
+        SyncCommand::FetchAttachment {
+            message: report.id,
+            part: 0,
+            destination: destination.clone(),
+        },
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if let jmail_core::events::Event::AttachmentSaved { error, .. } = event {
+            assert!(error.is_none(), "save failed: {error:?}");
+            break;
+        }
+    }
+    let bytes = std::fs::read(&destination).unwrap();
+    assert_eq!(bytes, b"%PDF-1.4 mock quarterly report\n");
+    std::fs::remove_file(&destination).ok();
 
     engine.stop_account(account);
     server.shutdown().await;

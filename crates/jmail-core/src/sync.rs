@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use crate::cache::Db;
 use crate::credentials::{self, Credential, Purpose};
 use crate::error::{Error, Result};
 use crate::events::Event;
-use crate::folder::SpecialUse;
+use crate::folder::{FolderId, SpecialUse};
 use crate::imap::{ImapSession, ImapSettings, TlsTrust};
 use crate::message::{Attachment, Flags, MessageId};
 use crate::outgoing::{DraftRef, OutgoingAttachment, OutgoingMessage};
@@ -27,6 +28,15 @@ const PREFETCH_CHUNK: usize = 5;
 const PREFETCH_COOLDOWN: Duration = Duration::from_secs(5);
 /// Let the initial sync settle before background prefetch starts.
 const PREFETCH_START_DELAY: Duration = Duration::from_secs(5);
+
+/// Where a conversation should be moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveTarget {
+    /// A folder with the given special use (Inbox/Sent/Trash/…).
+    Special(SpecialUse),
+    /// A specific folder chosen by the user.
+    Folder(FolderId),
+}
 
 /// Commands the UI can send to an account's sync worker.
 #[derive(Debug, Clone)]
@@ -46,10 +56,16 @@ pub enum SyncCommand {
     /// Set `\Flagged` on every message in the conversation identified by `message`.
     SetThreadFlagged { message: MessageId, flagged: bool },
     /// Move every message of the conversation (those in the representative's
-    /// folder) to a special-use folder.
-    MoveThread { message: MessageId, to: SpecialUse },
+    /// folder) to another folder.
+    MoveThread { message: MessageId, to: MoveTarget },
     /// Fetch and cache message bodies (batched per folder).
     FetchBodies { messages: Vec<MessageId> },
+    /// Fetch a message and save one of its MIME attachments to a local path.
+    FetchAttachment {
+        message: MessageId,
+        part: u32,
+        destination: PathBuf,
+    },
     /// Send a composed message and append a copy to Sent.
     Send {
         id: u64,
@@ -85,11 +101,18 @@ impl SyncEngine {
     /// the current tokio runtime with [`SyncEngine::start_account`].
     pub fn start(db: Db) -> (Self, mpsc::UnboundedReceiver<Event>) {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let poll_interval = db
+            .get_setting("sync.poll_interval")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(60));
         let engine = Self {
             db,
             events: events_tx,
             routing: Arc::new(StdMutex::new(HashMap::new())),
-            poll_interval: Duration::from_secs(60),
+            poll_interval,
         };
         (engine, events_rx)
     }
@@ -418,6 +441,13 @@ async fn run_session(
             }
             Some(SyncCommand::FetchBodies { messages }) => {
                 apply_fetch_bodies(db, &mut conn, account, messages, events).await?;
+            }
+            Some(SyncCommand::FetchAttachment {
+                message,
+                part,
+                destination,
+            }) => {
+                apply_fetch_attachment(db, &mut conn, message, part, destination, events).await?;
             }
             Some(SyncCommand::Send {
                 id,
@@ -757,7 +787,7 @@ async fn apply_move_thread(
     db: &Db,
     session: &mut ImapSession,
     identify: MessageId,
-    to: SpecialUse,
+    to: MoveTarget,
     events: &mpsc::UnboundedSender<Event>,
 ) -> Result<()> {
     let Some(message) = db.get_message(identify)? else {
@@ -765,34 +795,50 @@ async fn apply_move_thread(
     };
     let account = message.account_id;
     let folder_id = message.folder_id;
-    let destination = db
-        .folders(account)?
-        .into_iter()
-        .find(|folder| folder.special_use == to)
-        .map(|folder| folder.path);
+    let folders = db.folders(account)?;
+    let destination = match to {
+        MoveTarget::Special(special) => folders
+            .iter()
+            .find(|folder| folder.special_use == special)
+            .map(|folder| folder.path.clone()),
+        MoveTarget::Folder(id) => folders
+            .iter()
+            .find(|folder| folder.id == id)
+            .map(|folder| folder.path.clone()),
+    };
+    let Some(destination) = destination else {
+        if let MoveTarget::Folder(id) = to {
+            tracing::warn!(account = account.0, folder = id.0, "move target folder not found");
+            return Ok(());
+        }
+        // No special-use destination (e.g. archiving on a server without an
+        // Archive mailbox): fall back to marking the conversation seen.
+        let locations = db.thread_locations(account, &message.thread_id)?;
+        for (id, folder, path, uid, flags) in &locations {
+            if *folder != folder_id {
+                continue;
+            }
+            let mut new_flags = *flags;
+            new_flags.seen = true;
+            session.set_flags(path, *uid, new_flags).await?;
+            db.set_flags(*id, new_flags)?;
+        }
+        events
+            .send(Event::MessagesChanged {
+                account,
+                folder: folder_id,
+            })
+            .ok();
+        return Ok(());
+    };
     let locations = db.thread_locations(account, &message.thread_id)?;
 
-    match destination {
-        Some(destination) => {
-            for (id, folder, path, uid, _) in &locations {
-                if *folder != folder_id {
-                    continue;
-                }
-                session.move_message(path, *uid, &destination).await?;
-                db.delete_message(*id)?;
-            }
+    for (id, folder, path, uid, _) in &locations {
+        if *folder != folder_id {
+            continue;
         }
-        None => {
-            for (id, folder, path, uid, flags) in &locations {
-                if *folder != folder_id {
-                    continue;
-                }
-                let mut new_flags = *flags;
-                new_flags.seen = true;
-                session.set_flags(path, *uid, new_flags).await?;
-                db.set_flags(*id, new_flags)?;
-            }
-        }
+        session.move_message(path, *uid, &destination).await?;
+        db.delete_message(*id)?;
     }
     events
         .send(Event::MessagesChanged {
@@ -903,6 +949,59 @@ fn store_fetched_body(
     events
         .send(Event::BodyLoaded { account, message })
         .ok();
+    Ok(())
+}
+
+/// Fetch a message's raw form and write one MIME attachment to `destination`.
+/// Attachment bytes are not cached, so this re-downloads the message; failures
+/// are reported through [`Event::AttachmentSaved`] rather than the worker.
+async fn apply_fetch_attachment(
+    db: &Db,
+    session: &mut ImapSession,
+    message: MessageId,
+    part: u32,
+    destination: PathBuf,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<()> {
+    let report = |error: Option<String>| {
+        events
+            .send(Event::AttachmentSaved {
+                message,
+                part,
+                path: destination.clone(),
+                error,
+            })
+            .ok();
+    };
+    let Some((_account, path, _folder, uid, _)) = db.message_location(message)? else {
+        report(Some("message not found".to_string()));
+        return Ok(());
+    };
+    let raw = match session.fetch_full(&path, uid).await {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            report(Some("message is no longer on the server".to_string()));
+            return Ok(());
+        }
+        Err(error) => {
+            report(Some(error.to_string()));
+            return Ok(());
+        }
+    };
+    let Some(parsed) = mail_parser::MessageParser::default().parse(&raw) else {
+        report(Some("could not parse message".to_string()));
+        return Ok(());
+    };
+    let Some(attachment) = parsed.attachments().nth(part as usize) else {
+        report(Some("attachment not found".to_string()));
+        return Ok(());
+    };
+    if let Err(error) = std::fs::write(&destination, attachment.contents()) {
+        report(Some(error.to_string()));
+        return Ok(());
+    }
+    tracing::info!(message = message.0, part, path = %destination.display(), "saved attachment");
+    report(None);
     Ok(())
 }
 

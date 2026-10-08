@@ -7,7 +7,9 @@ use gtk::gio;
 use gtk::glib::BoxedAnyObject;
 use gtk::{Align, Orientation};
 
-use jmail_core::{AccountId, Db, Event, MessageId, SpecialUse, SyncEngine, ThreadFilter};
+use jmail_core::{
+    AccountId, Db, Event, MessageId, SpecialUse, SyncEngine, ThreadFilter, ThreadSummary,
+};
 
 use crate::context::AppContext;
 use crate::message_row::MessageRow;
@@ -19,6 +21,8 @@ use crate::message_row::MessageRow;
 #[derive(Clone)]
 pub struct Ui {
     pub window: adw::ApplicationWindow,
+    /// Presented over the whole window for transient messages (saved files…).
+    pub toast_overlay: adw::ToastOverlay,
     /// Kept for future per-pane toggles; the folder pane is always shown.
     #[allow(dead_code)]
     pub folders_split: adw::OverlaySplitView,
@@ -33,43 +37,32 @@ pub struct Ui {
     pub store: gio::ListStore,
     pub selection: gtk::SingleSelection,
     pub list_view: gtk::ListView,
-    pub search_filter: gtk::CustomFilter,
     pub search_query: Rc<RefCell<String>>,
-    /// Bumped on every preview so a stale mark-read timer can be ignored.
-    pub preview_generation: Rc<Cell<u64>>,
-    /// The message currently shown in the reading pane, for re-rendering.
-    pub preview_row: Rc<RefCell<Option<MessageRow>>>,
     /// While set, selection changes do not trigger a reading-pane preview.
     pub suppress_preview: Rc<Cell<bool>>,
     /// Coalesces bursts of body-arrived events into one reading-pane refresh.
     pub preview_reload_pending: Rc<Cell<bool>>,
-    /// Shown over the reading pane until a conversation is opened.
-    pub reading_empty: adw::StatusPage,
-    pub reading_subject: gtk::Label,
-    pub conversation: gtk::Box,
-    /// Holds the reused per-message cells.
-    pub messages_box: gtk::Box,
-    /// Reply / Reply all / Forward buttons below the conversation.
-    pub reply_bar: gtk::Box,
-    /// Holds an inline reply composer, if one is open.
-    pub compose_slot: gtk::Box,
-    pub reading_scroll: gtk::ScrolledWindow,
-    /// Long-lived per-message body cells. Each cell's WebView is created once
-    /// and reused for later messages so WebKit's compositing surface is never
-    /// torn down and re-created.
-    pub cells: Rc<RefCell<Vec<crate::actions::MessageCell>>>,
+    /// Coalesces bursts of `MessagesChanged` events into one list refresh.
+    pub messages_reload_pending: Rc<Cell<bool>>,
+    /// The main reading pane. Detached message windows build their own, but use
+    /// the same `ReadingPane` type so the views are identical.
+    pub reading: Rc<crate::actions::ReadingPane>,
+    /// Reading panes of open detached windows, kept alive while they are shown.
+    pub detached_panes: Rc<RefCell<Vec<Rc<crate::actions::ReadingPane>>>>,
     pub search_bar: gtk::SearchBar,
     pub search_entry: gtk::SearchEntry,
     pub search_toggle: gtk::ToggleButton,
     /// The active folder/conversation filter for the list.
     pub active_view: Rc<Cell<ThreadFilter>>,
+    /// Sidebar rows, so the active view can be highlighted.
+    folder_rows: Rc<RefCell<Vec<(ThreadFilter, adw::ActionRow)>>>,
+    /// Whether HTML bodies may load remote images (reading setting).
+    pub remote_images: Rc<Cell<bool>>,
     /// Result handlers for open compose windows, keyed by correlation id.
     pub compose_replies: Rc<RefCell<HashMap<u64, Rc<dyn Fn(crate::compose::ComposeOutcome)>>>>,
     next_compose_id: Rc<Cell<u64>>,
     /// A draft whose body is still being fetched before compose can open.
     pub pending_draft: Rc<RefCell<Option<MessageId>>>,
-    /// The correlation id of the open inline composer, if any.
-    pub inline_composer: Rc<Cell<Option<u64>>>,
 }
 
 impl Ui {
@@ -83,37 +76,31 @@ impl Ui {
         status_label.add_css_class("dim-label");
         status_label.add_css_class("caption");
 
+        let remote_images = Rc::new(Cell::new(crate::prefs::get_bool(
+            &db,
+            crate::prefs::REMOTE_IMAGES,
+            false,
+        )));
+
         let (header, search_toggle, window_title) = build_header();
         let folder_content = gtk::Box::new(Orientation::Vertical, 0);
         folder_content.set_margin_top(6);
         folder_content.set_margin_bottom(6);
         populate_folders(&folder_content, &db, None);
         let folder_pane = build_folder_pane(&folder_content);
-        let reading = build_reading_pane(&status_label);
+        let reading = crate::actions::ReadingPane::new(status_label.clone());
 
-        // Message list: store -> filter -> selection -> view.
+        // Message list: store -> selection -> view.
         let store = gio::ListStore::new::<BoxedAnyObject>();
         let search_query: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let preview_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-        let search_filter = gtk::CustomFilter::new({
-            let query = search_query.clone();
-            move |object| {
-                let query = query.borrow();
-                if query.is_empty() {
-                    return true;
-                }
-                object
-                    .downcast_ref::<BoxedAnyObject>()
-                    .map(|boxed| boxed.borrow::<MessageRow>().matches(query.as_str()))
-                    .unwrap_or(true)
-            }
-        });
-        let filter_model = gtk::FilterListModel::new(Some(store.clone()), Some(search_filter.clone()));
-        let selection = gtk::SingleSelection::new(Some(filter_model.clone()));
+        let selection = gtk::SingleSelection::new(Some(store.clone()));
         selection.set_autoselect(false);
         selection.set_can_unselect(true);
 
-        let list_view = gtk::ListView::new(Some(selection.clone()), Some(build_factory()));
+        let list_view = gtk::ListView::new(
+            Some(selection.clone()),
+            None::<gtk::SignalListItemFactory>,
+        );
         list_view.add_css_class("navigation-sidebar");
         // NOTE: `single-click-activate` also selects rows on hover in GTK, so
         // it stays off; single click is handled explicitly below.
@@ -157,12 +144,15 @@ impl Ui {
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&folders_split));
 
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&toolbar));
+
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Jmail")
             .default_width(1180)
             .default_height(760)
-            .content(&toolbar)
+            .content(&toast_overlay)
             .build();
 
         // Squeeze the list/reading split into a single pane on narrow windows.
@@ -174,6 +164,7 @@ impl Ui {
 
         let ui = Self {
             window,
+            toast_overlay,
             folders_split,
             list_split,
             window_title,
@@ -185,35 +176,51 @@ impl Ui {
             store,
             selection,
             list_view,
-            search_filter,
             search_query,
-            preview_generation,
-            preview_row: Rc::new(RefCell::new(None)),
             suppress_preview: Rc::new(Cell::new(false)),
             preview_reload_pending: Rc::new(Cell::new(false)),
-            reading_empty: reading.empty,
-            reading_subject: reading.subject,
-            conversation: reading.conversation,
-            messages_box: reading.messages_box,
-            reply_bar: reading.reply_bar,
-            compose_slot: reading.compose_slot,
-            reading_scroll: reading.scroll,
-            cells: Rc::new(RefCell::new(Vec::new())),
+            messages_reload_pending: Rc::new(Cell::new(false)),
+            reading,
+            detached_panes: Rc::new(RefCell::new(Vec::new())),
             search_bar,
             search_entry,
             search_toggle,
             active_view: Rc::new(Cell::new(ThreadFilter::Unified)),
+            folder_rows: Rc::new(RefCell::new(Vec::new())),
+            remote_images,
             compose_replies: Rc::new(RefCell::new(HashMap::new())),
             next_compose_id: Rc::new(Cell::new(0)),
             pending_draft: Rc::new(RefCell::new(None)),
-            inline_composer: Rc::new(Cell::new(None)),
         };
+
+        // The factory needs a `Ui` handle for the row context menu, so it is
+        // installed after the struct exists.
+        ui.list_view.set_factory(Some(&build_factory(&ui)));
+
+        // The main pane's Reply buttons route through the `win.*` actions (the
+        // same path the keyboard uses), which already target `ui.reading`.
+        {
+            let window = ui.window.clone();
+            ui.reading.set_on_reply(Rc::new(move |mode| {
+                let action = match mode {
+                    crate::compose::Mode::Reply => "win.reply",
+                    crate::compose::Mode::ReplyAll => "win.reply-all",
+                    crate::compose::Mode::Forward => "win.forward",
+                    _ => return,
+                };
+                let _ = gtk::prelude::WidgetExt::activate_action(&window, action, None);
+            }));
+        }
 
         crate::context::set(AppContext {
             db: ui.db.clone(),
             engine: ui.engine.clone(),
             runtime: ui.runtime.clone(),
         });
+        {
+            let ui = ui.clone();
+            crate::context::set_refresh_reading(Rc::new(move || ui.reload_reading_settings()));
+        }
 
         ui.connect_widgets();
         ui.reload_folders();
@@ -289,11 +296,7 @@ impl Ui {
     pub fn handle_event(&self, event: Event) {
         match event {
             Event::FoldersChanged { .. } => self.reload_folders(),
-            Event::MessagesChanged { .. } => {
-                self.reload_messages();
-                crate::actions::reload_preview(self);
-                self.maybe_open_pending_draft();
-            }
+            Event::MessagesChanged { .. } => crate::actions::schedule_messages_reload(self),
             Event::BodyLoaded { .. } => {
                 // The list itself did not change; only refresh the reading pane.
                 crate::actions::schedule_reload_preview(self);
@@ -326,6 +329,26 @@ impl Ui {
                 self.reload_messages();
             }
             Event::NewInboxMessage { .. } => {}
+            Event::AttachmentSaved { path, error, .. } => {
+                let toast = if let Some(error) = error {
+                    let toast = adw::Toast::new(&format!("Could not save attachment: {error}"));
+                    toast.set_timeout(5);
+                    toast
+                } else {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let toast = adw::Toast::new(&format!("Saved {name}"));
+                    toast.set_button_label(Some("Open"));
+                    let path = path.clone();
+                    toast.connect_button_clicked(move |_| {
+                        crate::actions::open_file(&path);
+                    });
+                    toast
+                };
+                self.toast_overlay.add_toast(toast);
+            }
         }
     }
 
@@ -377,29 +400,14 @@ impl Ui {
         self.compose_replies.borrow_mut().remove(&id);
     }
 
-    /// Remember the correlation id of the open inline composer.
-    pub fn set_inline_composer(&self, id: u64) {
-        self.inline_composer.set(Some(id));
-    }
-
     /// Remove the inline composer and forget its handler.
     pub fn clear_inline(&self) {
-        if let Some(id) = self.inline_composer.take() {
-            self.unregister_compose(id);
-        }
-        while let Some(child) = self.compose_slot.first_child() {
-            self.compose_slot.remove(&child);
-        }
-        self.reply_bar.set_visible(true);
+        self.reading.clear_inline(self);
     }
 
     /// Scroll the reading pane to the bottom (to reveal an inline composer).
     pub fn scroll_reading_to_bottom(&self) {
-        let scroll = self.reading_scroll.clone();
-        gtk::glib::idle_add_local_once(move || {
-            let adjustment = scroll.vadjustment();
-            adjustment.set_value(adjustment.upper() - adjustment.page_size());
-        });
+        self.reading.scroll_to_bottom();
     }
 
     /// Open a draft once its body has been fetched.
@@ -425,11 +433,24 @@ impl Ui {
         while let Some(child) = self.folder_content.first_child() {
             self.folder_content.remove(&child);
         }
+        self.folder_rows.borrow_mut().clear();
         populate_folders(&self.folder_content, &self.db, Some(self));
+        apply_folder_highlight(self);
     }
 
     pub fn present(&self) {
         self.window.present();
+    }
+
+    /// Re-read reading preferences (remote images) and re-render the open
+    /// conversation, e.g. after the setting is toggled in the dialog.
+    pub fn reload_reading_settings(&self) {
+        self.remote_images.set(crate::prefs::get_bool(
+            &self.db,
+            crate::prefs::REMOTE_IMAGES,
+            false,
+        ));
+        crate::actions::reload_preview(self);
     }
 
     /// Reload the message list from the cache (unified inbox, newest first),
@@ -438,15 +459,32 @@ impl Ui {
         let previous_thread = self.selected_thread_id();
         let previous_position = self.selection.selected();
 
-        self.store.remove_all();
-        match self.db.threads(self.active_view.get(), 500) {
+        let query = self.search_query.borrow().clone();
+        let results = if query.is_empty() {
+            self.db.threads(self.active_view.get(), 500)
+        } else {
+            // Search spans all cached mail (subject/sender/body), not just the
+            // rows currently loaded in the list.
+            self.db.search_threads(&query, 500)
+        };
+        let changed = match results {
             Ok(threads) => {
-                for thread in &threads {
-                    self.store
-                        .append(&BoxedAnyObject::new(MessageRow::from_thread(thread)));
+                if !query.is_empty() {
+                    self.status_label.set_text(&format!(
+                        "{} conversation(s) matching “{query}”",
+                        threads.len()
+                    ));
                 }
+                self.apply_threads(&threads)
             }
-            Err(error) => tracing::error!(%error, "failed to load messages"),
+            Err(error) => {
+                tracing::error!(%error, "failed to load messages");
+                false
+            }
+        };
+        if !changed {
+            // Nothing to update; leave the selection and reading pane alone.
+            return;
         }
 
         // Keep the same conversation selected if it is still present (its
@@ -472,9 +510,36 @@ impl Ui {
                 );
             } else {
                 // Nothing left in this view.
-                crate::actions::clear_preview(self);
+                crate::actions::clear_preview(self, &self.reading);
             }
         }
+    }
+
+    /// Update the list in place: only rows that differ from what is shown are
+    /// replaced, so unchanged rows are not rebound (which would drop their hover
+    /// state and tear down an open context menu). Returns whether anything
+    /// changed at all.
+    fn apply_threads(&self, threads: &[ThreadSummary]) -> bool {
+        let new_rows: Vec<MessageRow> = threads.iter().map(MessageRow::from_thread).collect();
+        let old_rows: Vec<MessageRow> = (0..self.store.n_items())
+            .filter_map(|index| self.store.item(index))
+            .filter_map(|object| object.downcast::<BoxedAnyObject>().ok())
+            .map(|boxed| boxed.borrow::<MessageRow>().clone())
+            .collect();
+
+        let (prefix, remove) = diff_indices(&old_rows, &new_rows);
+        let suffix = old_rows.len() - prefix - remove;
+        let additions: Vec<BoxedAnyObject> = new_rows[prefix..new_rows.len() - suffix]
+            .iter()
+            .cloned()
+            .map(BoxedAnyObject::new)
+            .collect();
+        if remove == 0 && additions.is_empty() {
+            return false;
+        }
+        self.store
+            .splice(prefix as u32, remove as u32, &additions);
+        true
     }
 
     /// Select a row without triggering the reading-pane preview. Used when a
@@ -518,18 +583,43 @@ impl Ui {
         }
         {
             let toggle = self.search_toggle.clone();
+            let ui = self.clone();
+            let query = self.search_query.clone();
             self.search_bar
                 .connect_search_mode_enabled_notify(move |bar| {
                     toggle.set_active(bar.is_search_mode());
+                    if !bar.is_search_mode() {
+                        // Closing search clears the query and restores the
+                        // folder view that was active underneath it.
+                        let had_query = !query.borrow().is_empty();
+                        query.borrow_mut().clear();
+                        if had_query {
+                            ui.search_entry.set_text("");
+                            ui.reload_messages();
+                        }
+                    }
                 });
         }
-        // Live filtering.
+        // Re-run the cache search after a short debounce so we query once per
+        // pause instead of on every keystroke.
         {
+            let ui = self.clone();
             let query = self.search_query.clone();
-            let filter = self.search_filter.clone();
+            let generation = Rc::new(Cell::new(0u64));
             self.search_entry.connect_search_changed(move |entry| {
-                *query.borrow_mut() = entry.text().to_lowercase();
-                filter.changed(gtk::FilterChange::Different);
+                *query.borrow_mut() = entry.text().trim().to_string();
+                let current = generation.get().wrapping_add(1);
+                generation.set(current);
+                let ui = ui.clone();
+                let generation = generation.clone();
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(150),
+                    move || {
+                        if generation.get() == current {
+                            ui.reload_messages();
+                        }
+                    },
+                );
             });
         }
         // Activation: double click opens a separate window in the wide layout;
@@ -579,7 +669,7 @@ impl Ui {
         // layout) so the first conversation avoids the cold-start black frame.
         {
             let ui = self.clone();
-            self.conversation.connect_map(move |_| {
+            self.reading.conversation.connect_map(move |_| {
                 crate::actions::preload_reading_pane(&ui);
             });
         }
@@ -594,17 +684,6 @@ impl Ui {
             });
         }
     }
-}
-
-struct ReadingPane {
-    root: gtk::Widget,
-    empty: adw::StatusPage,
-    subject: gtk::Label,
-    conversation: gtk::Box,
-    messages_box: gtk::Box,
-    reply_bar: gtk::Box,
-    compose_slot: gtk::Box,
-    scroll: gtk::ScrolledWindow,
 }
 
 fn build_header() -> (adw::HeaderBar, gtk::ToggleButton, adw::WindowTitle) {
@@ -672,6 +751,9 @@ fn populate_folders(content: &gtk::Box, db: &Db, ui: Option<&Ui>) {
     let joined = folder_list();
     let joined_row = folder_row("mail-unread-symbolic", "Joined Inbox", None);
     if let Some(ui) = ui {
+        ui.folder_rows
+            .borrow_mut()
+            .push((ThreadFilter::Unified, joined_row.clone()));
         let ui = ui.clone();
         joined_row.connect_activated(move |_| set_view(&ui, "Joined Inbox", ThreadFilter::Unified));
     }
@@ -712,8 +794,11 @@ fn populate_folders(content: &gtk::Box, db: &Db, ui: Option<&Ui>) {
                             None,
                         );
                         if let Some(ui) = ui {
-                            let ui = ui.clone();
                             let id = folder.id;
+                            ui.folder_rows
+                                .borrow_mut()
+                                .push((ThreadFilter::Folder(id), row.clone()));
+                            let ui = ui.clone();
                             let name = folder.name.clone();
                             row.connect_activated(move |_| {
                                 set_view(&ui, &name, ThreadFilter::Folder(id))
@@ -733,8 +818,21 @@ fn populate_folders(content: &gtk::Box, db: &Db, ui: Option<&Ui>) {
 pub fn set_view(ui: &Ui, label: &str, filter: ThreadFilter) {
     ui.active_view.set(filter);
     ui.window_title.set_subtitle(label);
+    apply_folder_highlight(ui);
     ui.reload_messages();
     ui.status_label.set_text(&format!("Viewing {label}"));
+}
+
+/// Highlight the sidebar row matching the active view (and clear the rest).
+fn apply_folder_highlight(ui: &Ui) {
+    let active = ui.active_view.get();
+    for (filter, row) in ui.folder_rows.borrow().iter() {
+        if *filter == active {
+            row.add_css_class("folder-active");
+        } else {
+            row.remove_css_class("folder-active");
+        }
+    }
 }
 
 fn folder_list() -> gtk::ListBox {
@@ -746,6 +844,9 @@ fn folder_list() -> gtk::ListBox {
 
 fn folder_row(icon: &str, title: &str, count: Option<&str>) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(title).build();
+    // AdwActionRow is unactivatable by default, so `activated` (and thus
+    // clicking a folder) would never fire without this.
+    row.set_activatable(true);
     row.add_prefix(&gtk::Image::from_icon_name(icon));
     if let Some(count) = count {
         let label = gtk::Label::new(Some(count));
@@ -755,7 +856,7 @@ fn folder_row(icon: &str, title: &str, count: Option<&str>) -> adw::ActionRow {
     row
 }
 
-fn folder_icon(special_use: SpecialUse) -> &'static str {
+pub(crate) fn folder_icon(special_use: SpecialUse) -> &'static str {
     match special_use {
         SpecialUse::Inbox => "mail-unread-symbolic",
         SpecialUse::Sent => "mail-send-symbolic",
@@ -768,14 +869,152 @@ fn folder_icon(special_use: SpecialUse) -> &'static str {
     }
 }
 
-fn build_factory() -> gtk::SignalListItemFactory {
-    let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, object| {
-        let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
-            return;
-        };
-        item.set_child(Some(&build_message_row()));
+/// The `(prefix, remove)` slice of `old` that must be replaced to turn it into
+/// `new`: everything before `prefix` and after `prefix + remove` is identical.
+fn diff_indices(old: &[MessageRow], new: &[MessageRow]) -> (usize, usize) {
+    let mut prefix = 0;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < (old.len() - prefix)
+        && suffix < (new.len() - prefix)
+        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    (prefix, old.len() - prefix - suffix)
+}
+
+/// The entries shown in the message context menu, grouped into sections.
+const MESSAGE_MENU: &[&[(&str, &str)]] = &[
+    &[("Open in New Window", "win.open-window")],
+    &[
+        ("Reply", "win.reply"),
+        ("Reply All", "win.reply-all"),
+        ("Forward", "win.forward"),
+    ],
+    &[
+        ("Move to Folder…", "win.move"),
+        ("Archive", "win.archive"),
+        ("Delete", "win.delete"),
+    ],
+    &[
+        ("Mark as Read", "win.mark-read"),
+        ("Mark as Unread", "win.mark-unread"),
+        ("Star", "win.star"),
+    ],
+];
+
+/// Select the row without opening it, then pop the message context menu anchored
+/// to the (stable) list view at the click point.
+fn show_message_context_menu(ui: &Ui, position: u32, row: &gtk::Widget, x: f64, y: f64) {
+    if position == u32::MAX {
+        return;
+    }
+    // Highlight the row the menu acts on, but do not preview/open it.
+    ui.select_quietly(position);
+
+    let point = row
+        .compute_point(&ui.list_view, &gtk::graphene::Point::new(x as f32, y as f32))
+        .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+
+    let popover = gtk::Popover::new();
+    popover.add_css_class("message-menu");
+    popover.set_has_arrow(false);
+
+    let content = gtk::Box::new(Orientation::Vertical, 0);
+    content.set_margin_top(4);
+    content.set_margin_bottom(4);
+    content.set_margin_start(4);
+    content.set_margin_end(4);
+    for (section, entries) in MESSAGE_MENU.iter().enumerate() {
+        if section > 0 {
+            content.append(&gtk::Separator::new(Orientation::Horizontal));
+        }
+        for (label, action) in entries.iter() {
+            content.append(&menu_button(ui, &popover, position, label, action));
+        }
+    }
+    popover.set_child(Some(&content));
+    popover.set_parent(&ui.list_view);
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+        point.x() as i32,
+        point.y() as i32,
+        1,
+        1,
+    )));
+    let popover_clone = popover.clone();
+    popover.connect_closed(move |_| popover_clone.unparent());
+    popover.popup();
+}
+
+/// One flat, full-width button in the message context menu. It re-asserts the
+/// row's selection and activates the matching `win.*` action directly, the same
+/// path the keyboard shortcuts use (so it can't fail through the popover's
+/// action muxer).
+fn menu_button(
+    ui: &Ui,
+    popover: &gtk::Popover,
+    position: u32,
+    label: &str,
+    action: &str,
+) -> gtk::Button {
+    let text = gtk::Label::new(Some(label));
+    text.set_xalign(0.0);
+    text.set_halign(gtk::Align::Fill);
+    let button = gtk::Button::builder().child(&text).build();
+    button.add_css_class("flat");
+    button.add_css_class("menu-item");
+    button.set_halign(gtk::Align::Fill);
+
+    let ui = ui.clone();
+    let popover = popover.clone();
+    let action = action.to_string();
+    let reply_like = matches!(
+        action.as_str(),
+        "win.reply" | "win.reply-all" | "win.forward"
+    );
+    button.connect_clicked(move |_| {
+        if reply_like {
+            // Open the clicked chain so the reply/forward targets it.
+            crate::actions::preview_position(&ui, position);
+        } else {
+            ui.select_quietly(position);
+        }
+        if let Err(error) = gtk::prelude::WidgetExt::activate_action(&ui.window, &action, None) {
+            tracing::warn!(action = %action, %error, "context menu action failed");
+        }
+        popover.popdown();
     });
+    button
+}
+
+fn build_factory(ui: &Ui) -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    {
+        let ui = ui.clone();
+        factory.connect_setup(move |_, object| {
+            let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let child = build_message_row();
+            item.set_child(Some(&child));
+
+            // Right-click opens the row's context menu at the cursor.
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(3);
+            {
+                let ui = ui.clone();
+                let item = item.clone();
+                let child = child.clone();
+                gesture.connect_pressed(move |_, _, x, y| {
+                    show_message_context_menu(&ui, item.position(), &child, x, y);
+                });
+            }
+            child.add_controller(gesture);
+        });
+    }
     factory.connect_bind(|_, object| {
         let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -887,112 +1126,64 @@ fn set_label(widget: &gtk::Widget, css: &str, text: &str) {
     }
 }
 
-fn build_reading_pane(status_label: &gtk::Label) -> ReadingPane {
-    let empty = adw::StatusPage::builder()
-        .icon_name("mail-read-symbolic")
-        .title("No conversation selected")
-        .description("Choose a message to read it here. Conversations are shown oldest first, newest at the bottom.")
-        .vexpand(true)
-        .build();
-    // Opaque so the pre-warmed (and initially black) body WebView mounted behind
-    // it is never visible while it paints for the first time.
-    empty.add_css_class("reading-empty");
-    empty.set_hexpand(true);
-    empty.set_vexpand(true);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let subject = gtk::Label::new(None);
-    subject.set_xalign(0.0);
-    subject.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    subject.add_css_class("title-3");
-    subject.set_margin_top(12);
-    subject.set_margin_bottom(6);
-    subject.set_margin_start(14);
-    subject.set_margin_end(14);
-
-    let conversation = gtk::Box::new(Orientation::Vertical, 0);
-    conversation.set_valign(Align::Start);
-
-    // Message cells go in `messages_box`; an inline reply composer is appended
-    // to `compose_slot` beneath them.
-    let messages_box = gtk::Box::new(Orientation::Vertical, 0);
-    let compose_slot = gtk::Box::new(Orientation::Vertical, 0);
-    let reply_bar = build_reply_bar();
-    conversation.append(&messages_box);
-    conversation.append(&reply_bar);
-    conversation.append(&compose_slot);
-
-    let scrolled = gtk::ScrolledWindow::builder()
-        .child(&conversation)
-        .vexpand(true)
-        .build();
-
-    let conversation_page = gtk::Box::new(Orientation::Vertical, 0);
-    conversation_page.append(&subject);
-    conversation_page.append(&gtk::Separator::new(Orientation::Horizontal));
-    conversation_page.append(&scrolled);
-
-    // The conversation page stays mounted (and mapped) behind the empty state,
-    // so a preloaded body WebView can warm up its compositing surface before the
-    // first conversation is opened.
-    let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&conversation_page));
-    overlay.add_overlay(&empty);
-    overlay.set_vexpand(true);
-
-    let footer = gtk::Box::new(Orientation::Horizontal, 0);
-    footer.set_margin_top(6);
-    footer.set_margin_bottom(6);
-    footer.set_margin_start(12);
-    footer.set_margin_end(12);
-    footer.append(status_label);
-
-    let root = gtk::Box::new(Orientation::Vertical, 0);
-    root.append(&overlay);
-    root.append(&gtk::Separator::new(Orientation::Horizontal));
-    root.append(&footer);
-
-    ReadingPane {
-        root: root.upcast(),
-        empty,
-        subject,
-        conversation,
-        messages_box,
-        reply_bar,
-        compose_slot,
-        scroll: scrolled,
+    fn row(id: i64, unread: bool) -> MessageRow {
+        MessageRow {
+            id,
+            account_id: 1,
+            thread_id: format!("t{id}"),
+            subject: format!("s{id}"),
+            sender: "x".into(),
+            snippet: String::new(),
+            date_label: String::new(),
+            unread,
+            starred: false,
+            message_count: 1,
+            unread_count: u32::from(unread),
+            starred_count: 0,
+        }
     }
-}
 
-/// The Reply / Reply all / Forward button row shown below the conversation.
-fn build_reply_bar() -> gtk::Box {
-    let bar = gtk::Box::new(Orientation::Horizontal, 8);
-    bar.set_halign(Align::Center);
-    bar.set_margin_top(12);
-    bar.set_margin_bottom(12);
-    bar.set_margin_start(14);
-    bar.set_margin_end(14);
-    bar.add_css_class("reply-bar");
-    // Hidden until a conversation is rendered.
-    bar.set_visible(false);
-    for (icon, label, action) in [
-        ("mail-reply-sender-symbolic", "Reply", "win.reply"),
-        ("mail-reply-all-symbolic", "Reply all", "win.reply-all"),
-        ("mail-forward-symbolic", "Forward", "win.forward"),
-    ] {
-        bar.append(&reply_button(icon, label, action));
+    #[test]
+    fn diff_detects_no_change() {
+        let old = vec![row(3, true), row(2, false)];
+        assert_eq!(diff_indices(&old, &old), (2, 0));
     }
-    bar
-}
 
-fn reply_button(icon: &str, label: &str, action: &str) -> gtk::Button {
-    let content = gtk::Box::new(Orientation::Horizontal, 6);
-    content.append(&gtk::Image::from_icon_name(icon));
-    content.append(&gtk::Label::new(Some(label)));
-    let button = gtk::Button::builder().child(&content).build();
-    button.add_css_class("pill");
-    let action = action.to_string();
-    button.connect_clicked(move |button| {
-        let _ = gtk::prelude::WidgetExt::activate_action(button, &action, None);
-    });
-    button
+    #[test]
+    fn diff_detects_prepend() {
+        let old = vec![row(2, false), row(1, false)];
+        let new = vec![row(3, true), row(2, false), row(1, false)];
+        assert_eq!(diff_indices(&old, &new), (0, 0));
+    }
+
+    #[test]
+    fn diff_detects_append() {
+        let old = vec![row(2, false)];
+        let new = vec![row(2, false), row(1, true)];
+        assert_eq!(diff_indices(&old, &new), (1, 0));
+    }
+
+    #[test]
+    fn diff_detects_removal() {
+        let old = vec![row(3, true), row(2, false), row(1, false)];
+        let new = vec![row(2, false), row(1, false)];
+        assert_eq!(diff_indices(&old, &new), (0, 1));
+    }
+
+    #[test]
+    fn diff_detects_middle_change() {
+        let old = vec![row(3, true), row(2, false), row(1, false)];
+        let new = vec![row(3, true), row(2, true), row(1, false)];
+        assert_eq!(diff_indices(&old, &new), (1, 1));
+    }
+
+    #[test]
+    fn diff_detects_clear() {
+        let old = vec![row(1, false)];
+        assert_eq!(diff_indices(&old, &[]), (0, 1));
+    }
 }

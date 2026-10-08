@@ -15,6 +15,16 @@
   background-color: @sidebar_bg_color;
 }
 
+/* The sidebar row for the folder currently shown in the list. */
+.folder-active {
+  background-color: alpha(@accent_bg_color, 0.25);
+  color: @accent_fg_color;
+}
+
+.folder-active image {
+  color: @accent_fg_color;
+}
+
 /* Message list rows. */
 .message-row .msg-subject {
   font-weight: 400;
@@ -67,4 +77,20 @@
 
 .result-error {
   color: @error_color;
+}
+
+/* Right-click context menu on a message row. */
+.message-menu button.menu-item {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-weight: 400;
+}
+
+.message-menu button.menu-item:hover {
+  background-color: alpha(@window_fg_color, 0.08);
+}
+
+.message-menu separator {
+  margin: 4px 0;
+  background-color: alpha(@borders, 0.6);
 }

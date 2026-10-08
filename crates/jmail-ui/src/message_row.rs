@@ -4,7 +4,7 @@ use jmail_core::ThreadSummary;
 /// A single row in the message list — one per conversation. `id` is the
 /// representative (latest) message in the thread. Plain Rust data wrapped in a
 /// `glib::BoxedAnyObject` so it can live in a `gio::ListStore`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MessageRow {
     pub id: i64,
     pub account_id: i64,
@@ -50,12 +50,6 @@ impl MessageRow {
         }
     }
 
-    /// Text used by the search filter.
-    pub fn matches(&self, query: &str) -> bool {
-        self.subject.to_lowercase().contains(query)
-            || self.sender.to_lowercase().contains(query)
-            || self.snippet.to_lowercase().contains(query)
-    }
 }
 
 /// Format a Unix timestamp for the list and conversation headers.

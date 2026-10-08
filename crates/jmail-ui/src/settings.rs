@@ -858,27 +858,54 @@ fn notifications_page() -> adw::PreferencesPage {
         .title("Desktop Notifications")
         .build();
 
+    let db = crate::context::get().map(|context| context.db.clone());
+
     let enable = adw::SwitchRow::builder()
         .title("Enable notifications")
         .subtitle("Show desktop notifications for new mail (off by default)")
         .build();
-    enable.set_active(false);
+    enable.set_active(
+        db.as_ref()
+            .map(|db| crate::prefs::get_bool(db, crate::prefs::NOTIFICATIONS_ENABLED, false))
+            .unwrap_or(false),
+    );
+    if let Some(db) = db.clone() {
+        enable.connect_active_notify(move |row| {
+            crate::prefs::set_bool(&db, crate::prefs::NOTIFICATIONS_ENABLED, row.is_active());
+        });
+    }
     group.add(&enable);
 
     let inbox_only = adw::SwitchRow::builder()
         .title("Inbox only")
         .subtitle("Only notify for new messages that land in the Inbox")
         .build();
-    inbox_only.set_active(true);
-    inbox_only.set_sensitive(false);
+    inbox_only.set_active(
+        db.as_ref()
+            .map(|db| crate::prefs::get_bool(db, crate::prefs::NOTIFICATIONS_INBOX_ONLY, true))
+            .unwrap_or(true),
+    );
+    if let Some(db) = db.clone() {
+        inbox_only.connect_active_notify(move |row| {
+            crate::prefs::set_bool(&db, crate::prefs::NOTIFICATIONS_INBOX_ONLY, row.is_active());
+        });
+    }
     group.add(&inbox_only);
 
     let grouping = adw::SwitchRow::builder()
         .title("Group by account")
         .subtitle("Replace an account's notification instead of stacking them")
         .build();
-    grouping.set_active(true);
-    grouping.set_sensitive(false);
+    grouping.set_active(
+        db.as_ref()
+            .map(|db| crate::prefs::get_bool(db, crate::prefs::NOTIFICATIONS_GROUP, true))
+            .unwrap_or(true),
+    );
+    if let Some(db) = db.clone() {
+        grouping.connect_active_notify(move |row| {
+            crate::prefs::set_bool(&db, crate::prefs::NOTIFICATIONS_GROUP, row.is_active());
+        });
+    }
     group.add(&grouping);
 
     page.add(&group);
@@ -893,18 +920,24 @@ fn reading_page() -> adw::PreferencesPage {
 
     let group = adw::PreferencesGroup::builder().title("Messages").build();
 
-    let conversation = adw::SwitchRow::builder()
-        .title("Conversation view")
-        .subtitle("Show a Gmail-style back-and-forth with the newest message at the bottom")
-        .build();
-    conversation.set_active(true);
-    group.add(&conversation);
+    let db = crate::context::get().map(|context| context.db.clone());
 
     let remote = adw::SwitchRow::builder()
         .title("Load remote images")
         .subtitle("Allow tracking pixels to load automatically")
         .build();
-    remote.set_active(false);
+    remote.set_active(
+        db.as_ref()
+            .map(|db| crate::prefs::get_bool(db, crate::prefs::REMOTE_IMAGES, false))
+            .unwrap_or(false),
+    );
+    if let Some(db) = db.clone() {
+        remote.connect_active_notify(move |row| {
+            crate::prefs::set_bool(&db, crate::prefs::REMOTE_IMAGES, row.is_active());
+            // Re-render the open conversation so the change is visible at once.
+            crate::context::refresh_reading();
+        });
+    }
     group.add(&remote);
 
     page.add(&group);
@@ -918,18 +951,21 @@ fn sync_page() -> adw::PreferencesPage {
         .build();
 
     let group = adw::PreferencesGroup::builder().title("Sync").build();
+    let db = crate::context::get().map(|context| context.db.clone());
 
-    let idle = adw::SwitchRow::builder()
-        .title("Use IMAP IDLE")
-        .subtitle("Ask the server to push changes when supported")
-        .build();
-    idle.set_active(true);
-    group.add(&idle);
-
-    let poll = adw::ActionRow::builder()
-        .title("Fallback poll interval")
-        .subtitle("60 seconds")
-        .build();
+    let seconds = db
+        .as_ref()
+        .map(|db| crate::prefs::get_u64(db, crate::prefs::POLL_INTERVAL, 60))
+        .unwrap_or(60);
+    let adjustment = gtk::Adjustment::new(seconds as f64, 10.0, 3600.0, 10.0, 60.0, 0.0);
+    let poll = adw::SpinRow::new(Some(&adjustment), 10.0, 0);
+    poll.set_title("Fallback poll interval");
+    poll.set_subtitle("Seconds between Inbox checks, applied on next launch");
+    if let Some(db) = db.clone() {
+        poll.connect_value_notify(move |row| {
+            crate::prefs::set_u64(&db, crate::prefs::POLL_INTERVAL, row.value() as u64);
+        });
+    }
     group.add(&poll);
 
     page.add(&group);
