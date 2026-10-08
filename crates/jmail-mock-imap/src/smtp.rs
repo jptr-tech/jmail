@@ -86,7 +86,17 @@ async fn handle_connection(socket: TcpStream, delivered: Arc<Mutex<Vec<Vec<u8>>>
 
         if upper.starts_with("EHLO") || upper.starts_with("HELO") {
             stream
-                .write_all(b"250-jmail mock SMTP\r\n250 AUTH PLAIN LOGIN\r\n")
+                .write_all(b"250-jmail mock SMTP\r\n250 AUTH PLAIN LOGIN XOAUTH2\r\n")
+                .await?;
+        } else if upper.starts_with("AUTH XOAUTH2") {
+            // XOAUTH2 carries the SASL response inline (SASL-IR) or on a
+            // continuation line.
+            if command.split_whitespace().count() < 3 {
+                stream.write_all(b"334 \r\n").await?;
+                read_discard(&mut stream).await?;
+            }
+            stream
+                .write_all(b"235 2.7.0 Authentication successful\r\n")
                 .await?;
         } else if upper.starts_with("AUTH LOGIN") {
             stream.write_all(b"334 VXNlcm5hbWU6\r\n").await?;

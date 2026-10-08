@@ -5,9 +5,11 @@
 
 pub mod account;
 pub mod cache;
+pub mod credentials;
 pub mod error;
 pub mod events;
 pub mod folder;
+pub mod goa;
 pub mod imap;
 pub mod markdown;
 pub mod message;
@@ -16,9 +18,11 @@ pub mod secrets;
 pub mod smtp;
 pub mod sync;
 pub mod threading;
+pub mod verify;
 
 pub use account::{Account, AccountId, AuthKind, Provider, Security};
 pub use cache::{Db, ThreadFilter, ThreadSummary};
+pub use credentials::{Credential, Purpose};
 pub use error::{Error, Result};
 pub use events::Event;
 pub use folder::{Folder, FolderId, SpecialUse};

@@ -19,6 +19,13 @@ pub enum Event {
     FoldersChanged { account: AccountId },
     /// A folder's message list changed (new mail, flags, deletions).
     MessagesChanged { account: AccountId, folder: FolderId },
+    /// A message body finished fetching. Unlike [`Event::MessagesChanged`] this
+    /// does not change the message list, so only the reading pane needs to
+    /// refresh.
+    BodyLoaded {
+        account: AccountId,
+        message: MessageId,
+    },
     /// A new message arrived in the Inbox and should be considered for a
     /// desktop notification.
     NewInboxMessage {
@@ -41,6 +48,9 @@ pub enum Event {
         draft: Option<DraftRef>,
         error: Option<String>,
     },
+    /// The set of accounts (or their enabled state) changed and the UI should
+    /// rebuild the folder pane and message list.
+    AccountsChanged,
     /// A recoverable error the UI should surface.
     Error { account: AccountId, message: String },
 }

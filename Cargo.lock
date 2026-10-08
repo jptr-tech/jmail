@@ -1351,6 +1351,7 @@ dependencies = [
  "tracing",
  "uuid",
  "webpki-roots",
+ "zbus",
 ]
 
 [[package]]
@@ -1373,6 +1374,7 @@ dependencies = [
 name = "jmail-ui"
 version = "0.1.0"
 dependencies = [
+ "async-channel 2.5.0",
  "gtk4",
  "jmail-core",
  "libadwaita",

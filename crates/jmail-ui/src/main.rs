@@ -6,6 +6,7 @@ mod markdown_editor;
 mod message_row;
 mod settings;
 mod util;
+mod welcome;
 mod window;
 
 use std::cell::RefCell;
@@ -74,7 +75,7 @@ fn main() -> glib::ExitCode {
             glib::ControlFlow::Continue
         });
         ui.present();
-        ui.start_all_accounts();
+        ui.bootstrap_accounts();
 
         if std::env::var("JMAIL_AUTOPREVIEW").as_deref() == Ok("1") {
             let a = ui.clone();

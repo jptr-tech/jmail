@@ -14,12 +14,14 @@ sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 
 finish-args:
-  # Network is required for IMAP/SMTP, OAuth and the loopback redirect.
+  # Network is required for IMAP/SMTP; the session bus is needed to read the
+  # GNOME Online Accounts configured in System Settings.
   - --share=network
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri
   - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.gnome.OnlineAccounts
   - --filesystem=xdg-download
   - --metadata=X-DConf=migrate-path=/tech/jptr/jmail/
 

@@ -12,7 +12,8 @@ gtk-rs + libadwaita. Flatpak app id `tech.jptr.jmail`.
   themed to match the app, auto-sized to content).
 - Compose in **markdown** with live inline styling and a rendered preview; send via
   SMTP, reply/reply-all/forward, and drafts saved to the server's Drafts folder.
-- Generic IMAP/SMTP with a password; Gmail via OAuth is planned.
+- Generic IMAP/SMTP with a password, plus sign-in through **GNOME Online
+  Accounts** (Google/Microsoft OAuth2 and IMAP/SMTP passwords).
 
 ## Requirements
 
@@ -59,7 +60,7 @@ Useful environment variables:
 |-------------------------|---------------------------------------------------------------|
 | `JMAIL_DEV_PLAINTEXT=1` | Store passwords in the DB instead of the system keyring (dev). |
 | `JMAIL_SEED=1`          | Insert demo accounts/messages on first launch.                 |
-| `RUST_LOG=debug`        | Verbose sync-engine logging.                                   |
+| `RUST_LOG=debug`        | Verbose sync-engine and IMAP connect/auth logging.             |
 
 ## Test server
 
@@ -95,6 +96,29 @@ cargo run -p jmail-mock-imap -- [--port N] [--smtp-port N] [--tls] [--push-after
 The demo mailbox has the folders **INBOX, Sent, Drafts, Archive, Trash, Spam,
 Projects**, with sample messages (including an HTML one) and reply messages.
 
+## GNOME Online Accounts
+
+Jmail does not run its own OAuth flow. It picks up the mail accounts already
+configured in **GNOME Online Accounts** (the `org.gnome.OnlineAccounts` session
+service, usually driven from *Settings → Online Accounts*):
+
+- On every launch — and whenever the window regains focus — the system accounts
+  are reconciled into the local cache. Newly discovered accounts are enabled and
+  synced automatically; a user's enable/disable choice is preserved.
+- OAuth2 accounts (e.g. Google) authenticate with SASL **XOAUTH2** using an
+  access token fetched from `goa-daemon`; password accounts (the GOA *IMAP/SMTP*
+  provider) read their password the same way. Jmail never stores those secrets.
+- Each GOA account has a switch in **Settings → Accounts** to disable it: its
+  folders and mail are hidden and syncing pauses, without touching the system
+  account (re-enabling restores them).
+
+Jmail never modifies GOA accounts. The first-run welcome dialog offers a button
+that opens the **system** Online Accounts settings when nothing is configured
+yet.
+
+> GOA is officially aimed at GNOME core applications; third-party access works
+> today but is not a guaranteed interface.
+
 ## Adding an account / logging in
 
 1. Launch the app.
@@ -114,8 +138,18 @@ Projects**, with sample messages (including an HTML one) and reply messages.
    | SMTP port     | `2525` (the mock's default; change if you passed `--smtp-port`) |
    | SMTP security | `None`           |
 
-4. Click **Add Account**. The engine connects, syncs folders, and the Joined
-   Inbox fills. Select a message to preview it; the body is fetched on demand.
+4. Click **Add Account**. The dialog first checks that IMAP (and SMTP, if you
+   filled in an SMTP server) accepts the settings; only then is the account
+   saved. The engine syncs folders and the Joined Inbox fills. Select a message
+   to preview it; the body is fetched on demand.
+
+**Test** runs the same check without saving. **Save** refuses to persist an
+account whose servers reject the connection. If a server presents a certificate
+that cannot be verified, you are asked to confirm before it is accepted for that
+account (stored as *accept invalid certificates*, only for that account).
+
+Custom accounts added this way can be revised later with **Edit** on the
+account row (GOA accounts instead have an enable switch).
 
 > In the Flatpak sandbox `127.0.0.1` is the host loopback, so the mock server
 > running on your machine is reachable.

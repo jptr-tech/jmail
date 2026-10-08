@@ -233,7 +233,8 @@ fn open_draft(ui: &Ui, row: &MessageRow) {
     *ui.pending_draft.borrow_mut() = Some(message);
     let account = AccountId(row.account_id);
     if ui.engine.is_running(account) {
-        ui.engine.send(account, SyncCommand::FetchBody { message });
+        ui.engine
+            .send(account, SyncCommand::FetchBodies { messages: vec![message] });
     }
     ui.status_label.set_text("Loading draft…");
 }
@@ -271,6 +272,34 @@ pub(crate) fn request_preview(ui: &Ui, position: u32) {
         return;
     };
     begin_preview(ui, &row, false);
+}
+
+/// Show whatever now occupies `position` after the selected conversation was
+/// removed (deleted/moved). In the narrow layout `open` brings up the reading
+/// pane so it is not left showing the message that was just deleted.
+pub(crate) fn preview_after_removal(ui: &Ui, position: u32, open: bool) {
+    let Some(row) = row_at(ui, position) else {
+        clear_preview(ui);
+        return;
+    };
+    begin_preview(ui, &row, open);
+}
+
+/// Reset the reading pane to its empty state, e.g. when the last conversation
+/// in a folder is deleted.
+pub(crate) fn clear_preview(ui: &Ui) {
+    *ui.preview_row.borrow_mut() = None;
+    ui.clear_inline();
+    ui.reading_empty.set_visible(true);
+    ui.reply_bar.set_visible(false);
+    for cell in ui.cells.borrow().iter() {
+        cell.root.set_visible(false);
+    }
+    // In the narrow layout, fall back to the list; in the wide layout the empty
+    // state fills the already-visible reading pane.
+    if ui.list_split.is_collapsed() {
+        ui.list_split.set_show_content(false);
+    }
 }
 
 /// Single click: preview and make sure the reading pane is shown.
@@ -1026,19 +1055,31 @@ fn ensure_thread_bodies(ui: &Ui, row: &MessageRow) {
     let Ok(messages) = ui.db.thread_messages(account, &row.thread_id, 50) else {
         return;
     };
-    for message in messages {
-        let cached = ui
-            .db
-            .message_body(message.id)
-            .ok()
-            .flatten()
-            .map(|body| body.text.is_some() || body.html.is_some())
-            .unwrap_or(false);
-        if !cached {
-            ui.engine
-                .send(account, SyncCommand::FetchBody { message: message.id });
-        }
+    // One batched command for the whole conversation, so the worker fetches all
+    // bodies in as few round trips as possible instead of one per message.
+    let pending: Vec<MessageId> = messages
+        .into_iter()
+        .filter(|message| !ui.db.body_loaded(message.id).unwrap_or(false))
+        .map(|message| message.id)
+        .collect();
+    if !pending.is_empty() {
+        ui.engine.send(account, SyncCommand::FetchBodies { messages: pending });
     }
+}
+
+/// Coalesce a burst of body arrivals into a single reading-pane refresh. Body
+/// fetches finish one at a time; without this the whole conversation (and its
+/// WebViews) would be rebuilt once per message.
+pub(crate) fn schedule_reload_preview(ui: &Ui) {
+    if ui.preview_reload_pending.get() {
+        return;
+    }
+    ui.preview_reload_pending.set(true);
+    let ui = ui.clone();
+    gtk::glib::timeout_add_local_once(Duration::from_millis(40), move || {
+        ui.preview_reload_pending.set(false);
+        reload_preview(&ui);
+    });
 }
 
 /// Mark every message in a conversation read, updating the cache, the list and

@@ -20,7 +20,7 @@ use crate::folder::{Folder, FolderId, SpecialUse};
 use crate::message::{Address, Attachment, Flags, Message, MessageBody, MessageId, NewMessage};
 
 /// Bump when the schema changes and add a matching migration step.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 8;
 
 /// A conversation as shown in the unified inbox: the latest message plus
 /// aggregate counts.
@@ -108,6 +108,15 @@ impl Db {
         if version < 5 {
             conn.execute_batch(SCHEMA_V5).map_err(storage)?;
         }
+        if version < 6 {
+            conn.execute_batch(SCHEMA_V6).map_err(storage)?;
+        }
+        if version < 7 {
+            conn.execute_batch(SCHEMA_V7).map_err(storage)?;
+        }
+        if version < 8 {
+            conn.execute_batch(SCHEMA_V8).map_err(storage)?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(storage)?;
         Ok(())
@@ -121,8 +130,9 @@ impl Db {
             "INSERT INTO accounts
                 (name, email, display_name, provider, auth, username,
                  imap_host, imap_port, imap_security, smtp_host, smtp_port,
-                 smtp_security, color, enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 smtp_security, color, enabled, goa_object_path,
+                 accept_invalid_certs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 account.name,
                 account.email,
@@ -138,6 +148,8 @@ impl Db {
                 account.smtp_security.to_i64(),
                 account.color,
                 account.enabled as i64,
+                account.goa_object_path,
+                account.accept_invalid_certs as i64,
             ],
         )
         .map_err(storage)?;
@@ -150,7 +162,8 @@ impl Db {
             .prepare(
                 "SELECT id, name, email, display_name, provider, auth, username,
                         imap_host, imap_port, imap_security, smtp_host, smtp_port,
-                        smtp_security, color, enabled
+                        smtp_security, color, enabled, goa_object_path,
+                        accept_invalid_certs
                  FROM accounts ORDER BY id",
             )
             .map_err(storage)?;
@@ -160,6 +173,73 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage)?;
         Ok(rows)
+    }
+
+    /// Look up the account backed by a given GNOME Online Accounts object path.
+    pub fn account_by_goa_path(&self, object_path: &str) -> Result<Option<Account>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, email, display_name, provider, auth, username,
+                        imap_host, imap_port, imap_security, smtp_host, smtp_port,
+                        smtp_security, color, enabled, goa_object_path,
+                        accept_invalid_certs
+                 FROM accounts WHERE goa_object_path = ?1",
+            )
+            .map_err(storage)?;
+        let account = stmt
+            .query_map(params![object_path], map_account)
+            .map_err(storage)?
+            .next()
+            .transpose()
+            .map_err(storage)?;
+        Ok(account)
+    }
+
+    /// Update the server configuration of an existing account. The local-only
+    /// fields (`enabled`, `color`) and the row identity are left untouched, so
+    /// a user's enable/disable choice survives a GOA re-import.
+    pub fn update_account_config(&self, account: &Account) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE accounts SET
+                name = ?2, email = ?3, display_name = ?4, provider = ?5,
+                auth = ?6, username = ?7, imap_host = ?8, imap_port = ?9,
+                imap_security = ?10, smtp_host = ?11, smtp_port = ?12,
+                smtp_security = ?13, goa_object_path = ?14,
+                accept_invalid_certs = ?15
+             WHERE id = ?1",
+            params![
+                account.id.0,
+                account.name,
+                account.email,
+                account.display_name,
+                account.provider.to_i64(),
+                account.auth.to_i64(),
+                account.username,
+                account.imap_host,
+                account.imap_port as i64,
+                account.imap_security.to_i64(),
+                account.smtp_host,
+                account.smtp_port as i64,
+                account.smtp_security.to_i64(),
+                account.goa_object_path,
+                account.accept_invalid_certs as i64,
+            ],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Enable or disable an account without changing anything else.
+    pub fn set_account_enabled(&self, id: AccountId, enabled: bool) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE accounts SET enabled = ?2 WHERE id = ?1",
+            params![id.0, enabled as i64],
+        )
+        .map_err(storage)?;
+        Ok(())
     }
 
     pub fn account_count(&self) -> Result<i64> {
@@ -204,6 +284,41 @@ impl Db {
             )
             .map_err(storage)?;
         Ok(FolderId(id))
+    }
+
+    /// Delete any cached folder for `account` whose path is not in `keep_paths`,
+    /// along with its messages. Used after a successful `LIST` to drop mailboxes
+    /// the server no longer offers (including virtual ones we no longer sync).
+    /// Returns the number of folders removed.
+    pub fn retain_folders(&self, account: AccountId, keep_paths: &[String]) -> Result<usize> {
+        use std::collections::HashSet;
+        let keep: HashSet<&str> = keep_paths.iter().map(String::as_str).collect();
+        let conn = self.lock()?;
+        let existing: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, path FROM folders WHERE account_id = ?1")
+                .map_err(storage)?;
+            let rows = stmt
+                .query_map(params![account.0], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage)?;
+            rows
+        };
+        let mut removed = 0;
+        for (id, path) in existing {
+            if keep.contains(path.as_str()) {
+                continue;
+            }
+            conn.execute("DELETE FROM messages WHERE folder_id = ?1", params![id])
+                .map_err(storage)?;
+            conn.execute("DELETE FROM folders WHERE id = ?1", params![id])
+                .map_err(storage)?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     pub fn folders(&self, account: AccountId) -> Result<Vec<Folder>> {
@@ -355,6 +470,7 @@ impl Db {
             .prepare(&format!(
                 "SELECT {MESSAGE_COLUMNS} FROM messages m
                  JOIN folders f ON f.id = m.folder_id
+                 JOIN accounts a ON a.id = m.account_id AND a.enabled = 1
                  WHERE f.special_use = ?1
                  ORDER BY m.date DESC, m.id DESC LIMIT ?2"
             ))
@@ -384,7 +500,23 @@ impl Db {
             ThreadFilter::All => ("WHERE (?1 IS NULL)", None),
         };
         let sql = format!(
-            "WITH ranked AS (
+            "WITH filtered AS (
+                    SELECT {MESSAGE_COLUMNS}, f.special_use AS folder_special
+                    FROM messages m
+                    JOIN folders f ON f.id = m.folder_id
+                    JOIN accounts a ON a.id = m.account_id AND a.enabled = 1
+                    {filter_where}
+                 ),
+                 deduped AS (
+                    SELECT m.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY m.account_id,
+                                   CASE WHEN m.message_id = '' THEN 'id:' || m.id ELSE m.message_id END
+                               ORDER BY (m.folder_special = ?2) DESC, m.id ASC
+                           ) AS dedup_rn
+                    FROM filtered m
+                 ),
+                 ranked AS (
                     SELECT {MESSAGE_COLUMNS},
                            ROW_NUMBER() OVER (PARTITION BY m.account_id, m.thread_id
                                               ORDER BY m.date DESC, m.id DESC) AS rn,
@@ -393,16 +525,15 @@ impl Db {
                                OVER (PARTITION BY m.account_id, m.thread_id) AS unread,
                            SUM(CASE WHEN (m.flags & 4) != 0 THEN 1 ELSE 0 END)
                                OVER (PARTITION BY m.account_id, m.thread_id) AS starred
-                    FROM messages m
-                    JOIN folders f ON f.id = m.folder_id
-                    {filter_where}
+                    FROM deduped m
+                    WHERE m.dedup_rn = 1
                  )
-                 SELECT * FROM ranked WHERE rn = 1 ORDER BY date DESC, id DESC LIMIT ?2"
+                 SELECT * FROM ranked WHERE rn = 1 ORDER BY date DESC, id DESC LIMIT ?3"
         );
         let conn = self.lock()?;
         let mut stmt = conn.prepare(&sql).map_err(storage)?;
         let rows = stmt
-            .query_map(params![filter_param, limit], |row| {
+            .query_map(params![filter_param, SpecialUse::Inbox.to_i64(), limit], |row| {
                 Ok(ThreadSummary {
                     message: map_message(row)?,
                     count: row.get::<_, i64>(19)? as u32,
@@ -573,13 +704,26 @@ impl Db {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {MESSAGE_COLUMNS} FROM messages m
-                 WHERE m.account_id = ?1 AND m.thread_id = ?2
-                 ORDER BY m.date ASC, m.id ASC LIMIT ?3"
+                "WITH ranked AS (
+                     SELECT {MESSAGE_COLUMNS},
+                            ROW_NUMBER() OVER (
+                                PARTITION BY m.account_id,
+                                    CASE WHEN m.message_id = '' THEN 'id:' || m.id ELSE m.message_id END
+                                ORDER BY (f.special_use = ?3) DESC, m.id ASC
+                            ) AS dedup_rn
+                     FROM messages m
+                     JOIN folders f ON f.id = m.folder_id
+                     WHERE m.account_id = ?1 AND m.thread_id = ?2
+                 )
+                 SELECT * FROM ranked WHERE dedup_rn = 1
+                 ORDER BY date ASC, id ASC LIMIT ?4"
             ))
             .map_err(storage)?;
         let rows = stmt
-            .query_map(params![account.0, thread_id, limit], map_message)
+            .query_map(
+                params![account.0, thread_id, SpecialUse::Inbox.to_i64(), limit],
+                map_message,
+            )
             .map_err(storage)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage)?;
@@ -704,7 +848,8 @@ impl Db {
             .prepare(
                 "SELECT id, name, email, display_name, provider, auth, username,
                         imap_host, imap_port, imap_security, smtp_host, smtp_port,
-                        smtp_security, color, enabled
+                        smtp_security, color, enabled, goa_object_path,
+                        accept_invalid_certs
                  FROM accounts WHERE id = ?1",
             )
             .map_err(storage)?;
@@ -796,11 +941,26 @@ impl Db {
     ) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
-            "UPDATE messages SET body_text = ?1, body_html = ?2, snippet = ?3 WHERE id = ?4",
+            "UPDATE messages SET body_text = ?1, body_html = ?2, snippet = ?3, body_loaded = 1
+             WHERE id = ?4",
             params![text, html, snippet, id.0],
         )
         .map_err(storage)?;
         Ok(())
+    }
+
+    /// Whether this message's body has already been fetched (even if the
+    /// message turned out to have no text or HTML part).
+    pub fn body_loaded(&self, id: MessageId) -> Result<bool> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT body_loaded FROM messages WHERE id = ?1",
+            params![id.0],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(0) != 0)
+        .map_err(storage)
     }
 
     /// Replace the cached attachment metadata for a message and update its
@@ -1110,6 +1270,8 @@ fn map_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         smtp_security: Security::from_i64(row.get(12)?),
         color: row.get(13)?,
         enabled: row.get::<_, i64>(14)? != 0,
+        goa_object_path: row.get(15)?,
+        accept_invalid_certs: row.get::<_, i64>(16)? != 0,
     })
 }
 
@@ -1277,6 +1439,28 @@ const SCHEMA_V5: &str = r#"
 ALTER TABLE messages ADD COLUMN reply_to_json TEXT NOT NULL DEFAULT '[]';
 "#;
 
+/// Marks accounts sourced from GNOME Online Accounts and stores the object path
+/// used to reconcile them with the system account each launch.
+const SCHEMA_V6: &str = r#"
+ALTER TABLE accounts ADD COLUMN goa_object_path TEXT;
+"#;
+
+/// Whether the account accepts invalid TLS certificates (set only after the
+/// user confirms an untrusted certificate during account setup).
+const SCHEMA_V7: &str = r#"
+ALTER TABLE accounts ADD COLUMN accept_invalid_certs INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// Marks a message whose body has been fetched. A message can legitimately have
+/// neither a text nor an HTML part (attachment-only, calendar invite, parse
+/// miss); without this flag those would look "not cached" forever and be
+/// re-fetched on every render.
+const SCHEMA_V8: &str = r#"
+ALTER TABLE messages ADD COLUMN body_loaded INTEGER NOT NULL DEFAULT 0;
+UPDATE messages SET body_loaded = 1
+    WHERE body_text IS NOT NULL OR body_html IS NOT NULL;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1338,6 +1522,71 @@ mod tests {
         let second = db.upsert_message(&message).unwrap();
         assert_eq!(first, second);
         assert_eq!(db.unified_inbox(100).unwrap().len(), before + 1);
+    }
+
+    #[test]
+    fn body_loaded_tracks_empty_bodies() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let mut inbox = db.unified_inbox(1).unwrap();
+        let message = inbox.remove(0);
+        assert!(!db.body_loaded(message.id).unwrap());
+        // A body with neither text nor HTML (e.g. attachment-only) still counts
+        // as loaded, so it is not re-fetched forever.
+        db.set_body(message.id, None, None, "").unwrap();
+        assert!(db.body_loaded(message.id).unwrap());
+    }
+
+    #[test]
+    fn retain_folders_prunes_unlisted_mailboxes() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let account = db.accounts().unwrap()[0].id;
+        let folders = db.folders(account).unwrap();
+        assert!(folders.len() > 1);
+        let keep = vec![folders[0].path.clone()];
+        let removed = db.retain_folders(account, &keep).unwrap();
+        assert_eq!(removed, folders.len() - 1);
+        assert_eq!(db.folders(account).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn thread_messages_dedupes_by_message_id() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let account = db.accounts().unwrap()[0].id;
+        let folders = db.folders(account).unwrap();
+        let inbox = folders
+            .iter()
+            .find(|f| f.special_use == SpecialUse::Inbox)
+            .unwrap()
+            .clone();
+        let other = folders.iter().find(|f| f.id != inbox.id).unwrap().clone();
+        let make = |folder: FolderId, uid: u32| NewMessage {
+            account_id: account,
+            folder_id: folder,
+            uid,
+            message_id: "dup@example.org".into(),
+            thread_id: "dup-thread".into(),
+            in_reply_to: String::new(),
+            references: Vec::new(),
+            subject: "Duplicate".into(),
+            from: Address::new("Sender", "sender@example.org"),
+            to: vec![],
+            cc: vec![],
+            reply_to: Vec::new(),
+            date: OffsetDateTime::now_utc(),
+            flags: Flags::default(),
+            snippet: String::new(),
+            has_attachments: false,
+            body_text: None,
+            body_html: None,
+        };
+        db.upsert_message(&make(inbox.id, 1)).unwrap();
+        db.upsert_message(&make(other.id, 2)).unwrap();
+        let messages = db.thread_messages(account, "dup-thread", 50).unwrap();
+        assert_eq!(messages.len(), 1, "copies should collapse: {messages:?}");
+        assert_eq!(messages[0].folder_id, inbox.id, "the Inbox copy should win");
     }
 
     #[test]
@@ -1570,5 +1819,45 @@ mod tests {
         assert_eq!(db.get_setting("theme").unwrap(), None);
         db.set_setting("theme", "dark").unwrap();
         assert_eq!(db.get_setting("theme").unwrap().as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn goa_account_round_trips_and_is_findable() {
+        let db = db();
+        let path = "/org/gnome/OnlineAccounts/Accounts/account_1";
+        let mut account = Account::generic("you@example.com");
+        account.goa_object_path = Some(path.to_string());
+        let id = db.insert_account(&account).unwrap();
+
+        let found = db.account_by_goa_path(path).unwrap().expect("account");
+        assert_eq!(found.id, id);
+        assert_eq!(found.goa_object_path.as_deref(), Some(path));
+
+        db.set_account_enabled(id, false).unwrap();
+        assert!(!db.account(id).unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn disabling_an_account_hides_its_mail() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let generic = db
+            .accounts()
+            .unwrap()
+            .into_iter()
+            .find(|account| account.email == "you@example.com")
+            .unwrap();
+
+        let before = db.unified_inbox(100).unwrap().len();
+        db.set_account_enabled(generic.id, false).unwrap();
+
+        let inbox = db.unified_inbox(100).unwrap();
+        assert!(inbox.len() < before);
+        assert!(inbox.iter().all(|message| message.account_id != generic.id));
+        assert!(db
+            .threads(ThreadFilter::All, 100)
+            .unwrap()
+            .iter()
+            .all(|thread| thread.message.account_id != generic.id));
     }
 }

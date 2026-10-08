@@ -2,6 +2,7 @@
 //! server via IMAP IDLE plus a periodic poll.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -9,14 +10,23 @@ use tokio::sync::mpsc;
 
 use crate::account::AccountId;
 use crate::cache::Db;
+use crate::credentials::{self, Credential, Purpose};
 use crate::error::{Error, Result};
 use crate::events::Event;
 use crate::folder::SpecialUse;
 use crate::imap::{ImapSession, ImapSettings, TlsTrust};
 use crate::message::{Attachment, Flags, MessageId};
 use crate::outgoing::{DraftRef, OutgoingAttachment, OutgoingMessage};
-use crate::secrets;
 use crate::smtp::{self, SmtpSettings};
+
+/// How many of the newest Inbox messages to warm in the background.
+const PREFETCH_LIMIT: u32 = 100;
+/// Messages fetched per background prefetch batch.
+const PREFETCH_CHUNK: usize = 5;
+/// Pause between background prefetch batches so user actions take priority.
+const PREFETCH_COOLDOWN: Duration = Duration::from_secs(5);
+/// Let the initial sync settle before background prefetch starts.
+const PREFETCH_START_DELAY: Duration = Duration::from_secs(5);
 
 /// Commands the UI can send to an account's sync worker.
 #[derive(Debug, Clone)]
@@ -38,8 +48,8 @@ pub enum SyncCommand {
     /// Move every message of the conversation (those in the representative's
     /// folder) to a special-use folder.
     MoveThread { message: MessageId, to: SpecialUse },
-    /// Fetch and cache a message body.
-    FetchBody { message: MessageId },
+    /// Fetch and cache message bodies (batched per folder).
+    FetchBodies { messages: Vec<MessageId> },
     /// Send a composed message and append a copy to Sent.
     Send {
         id: u64,
@@ -90,16 +100,32 @@ impl SyncEngine {
 
     /// Send a command to one account's worker (no-op if it is not running).
     pub fn send(&self, account: AccountId, command: SyncCommand) {
-        if let Some(sender) = self.routing.lock().unwrap().get(&account) {
-            if sender.send(command).is_err() {
-                self.routing.lock().unwrap().remove(&account);
+        let sender = self.routing.lock().unwrap().get(&account).cloned();
+        match sender {
+            Some(sender) => {
+                if sender.send(command).is_err() {
+                    self.routing.lock().unwrap().remove(&account);
+                    tracing::warn!(
+                        account = account.0,
+                        "sync worker has stopped; dropping command"
+                    );
+                }
             }
+            None => tracing::warn!(
+                account = account.0,
+                "no sync worker for account; dropping command"
+            ),
         }
     }
 
     /// Whether a sync worker is currently registered for the account.
     pub fn is_running(&self, account: AccountId) -> bool {
         self.routing.lock().unwrap().contains_key(&account)
+    }
+
+    /// Tell the UI that the account list or an account's enabled state changed.
+    pub fn notify_accounts_changed(&self) {
+        self.events.send(Event::AccountsChanged).ok();
     }
 
     /// Send a command to every running worker.
@@ -115,22 +141,32 @@ impl SyncEngine {
             return Err(Error::AccountNotFound(account.0));
         };
         let account_id = account.id;
-        let Some(password) = secrets::load_password(&self.db, account_id)? else {
-            let error = format!(
-                "no stored password for {}; add the account again",
-                account.email
-            );
+
+        // Reserve the routing slot *before* the first await. Otherwise two
+        // concurrent calls (e.g. initial bootstrap racing a window-focus
+        // refresh) can both pass the running check and spawn two workers, and
+        // therefore two IMAP connections, for the same account.
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        {
+            let mut routing = self.routing.lock().unwrap();
+            if routing.contains_key(&account_id) {
+                return Ok(());
+            }
+            routing.insert(account_id, command_tx);
+        }
+
+        if let Err(error) = credentials::for_account(&self.db, &account, Purpose::Imap).await {
+            self.routing.lock().unwrap().remove(&account_id);
+            tracing::warn!(account = account_id.0, %error, "cannot resolve account credentials");
+            let message = format!("cannot authenticate {}: {error}", account.email);
             self.events
                 .send(Event::Error {
                     account: account_id,
-                    message: error.clone(),
+                    message,
                 })
                 .ok();
             return Err(Error::Authentication(account_id.0));
-        };
-
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-        self.routing.lock().unwrap().insert(account_id, command_tx);
+        }
 
         let db = self.db.clone();
         let events = self.events.clone();
@@ -146,6 +182,7 @@ impl SyncEngine {
             port: account.smtp_port,
             security: account.smtp_security,
             username: account.username.clone(),
+            accept_invalid_certs: account.accept_invalid_certs,
         };
         let account_id = account.id;
 
@@ -155,7 +192,6 @@ impl SyncEngine {
                 account_id,
                 settings,
                 smtp,
-                password,
                 command_rx,
                 events,
                 poll_interval,
@@ -179,7 +215,6 @@ async fn worker(
     account: AccountId,
     settings: ImapSettings,
     smtp: SmtpSettings,
-    password: String,
     mut commands: mpsc::UnboundedReceiver<SyncCommand>,
     events: mpsc::UnboundedSender<Event>,
     poll_interval: Duration,
@@ -192,7 +227,6 @@ async fn worker(
             account,
             &settings,
             &smtp,
-            &password,
             &mut commands,
             &events,
             poll_interval,
@@ -228,17 +262,31 @@ async fn run_session(
     account: AccountId,
     settings: &ImapSettings,
     smtp: &SmtpSettings,
-    password: &str,
     commands: &mut mpsc::UnboundedReceiver<SyncCommand>,
     events: &mpsc::UnboundedSender<Event>,
     poll_interval: Duration,
 ) -> Result<()> {
-    let trust = TlsTrust::system()?;
-    let mut session = ImapSession::connect(settings.clone(), password, &trust).await?;
+    let account_row = db
+        .account(account)?
+        .ok_or(Error::AccountNotFound(account.0))?;
+    let trust = TlsTrust::for_account(&account_row)?;
+    let credential = credentials::for_account(db, &account_row, Purpose::Imap).await?;
+    let mut session = ImapSession::connect(settings.clone(), credential, &trust).await?;
     let supports_move = session.supports_move();
+    tracing::info!(
+        account = account.0,
+        email = %account_row.email,
+        host = %settings.host,
+        "connected; syncing folders"
+    );
 
     // 1. Folders + 2. initial header sync for every folder.
     let (mut folder_ids, mut inbox_path) = sync_all_folders(db, &mut session, account, events).await?;
+    tracing::info!(
+        account = account.0,
+        folders = folder_ids.len(),
+        "initial sync complete; entering IDLE"
+    );
 
     // 3. Idle loop over the Inbox.
     let Some(mut inbox_path) = inbox_path.take() else {
@@ -247,12 +295,24 @@ async fn run_session(
 
     let mut session = Some(session);
     let mut first_idle = true;
+    // Warm the newest Inbox bodies in the background, a small batch at a time,
+    // so opening recent mail is instant (and the list gets snippets).
+    let mut prefetch: VecDeque<MessageId> = prefetch_queue(db, account).into();
+    if !prefetch.is_empty() {
+        tracing::debug!(
+            account = account.0,
+            queued = prefetch.len(),
+            "queueing background body prefetch"
+        );
+    }
+    let mut next_prefetch = tokio::time::Instant::now() + PREFETCH_START_DELAY;
     loop {
         let Some(current) = session.take() else { return Ok(()) };
         let unsolicited = current.unsolicited_receiver();
         let mut handle = current.into_idle();
         handle.init().await.map_err(protocol)?;
         let deadline = tokio::time::Instant::now() + poll_interval;
+        let mut prefetch_now = false;
         let got_command = if first_idle {
             // Mail that arrived between the initial sync and the IDLE
             // subscription would be missed until the next poll, so resync once
@@ -282,11 +342,26 @@ async fn run_session(
                         }
                     }
                     _ = tokio::time::sleep_until(deadline) => break None, // poll tick
+                    _ = tokio::time::sleep_until(next_prefetch), if !prefetch.is_empty() => {
+                        prefetch_now = true;
+                        break None;
+                    }
                 }
             }
         };
         let raw = handle.done().await.map_err(protocol)?;
         let mut conn = ImapSession::from_session(raw, settings.clone(), supports_move);
+
+        if prefetch_now {
+            let count = prefetch.len().min(PREFETCH_CHUNK);
+            let chunk: Vec<MessageId> = prefetch.drain(..count).collect();
+            if let Err(error) = apply_fetch_bodies(db, &mut conn, account, chunk, events).await {
+                tracing::warn!(account = account.0, %error, "background prefetch failed");
+            }
+            next_prefetch = tokio::time::Instant::now() + PREFETCH_COOLDOWN;
+            session = Some(conn);
+            continue;
+        }
 
         match got_command {
             Some(SyncCommand::Shutdown) => return Ok(()),
@@ -341,26 +416,41 @@ async fn run_session(
             Some(SyncCommand::MoveThread { message, to }) => {
                 apply_move_thread(db, &mut conn, message, to, events).await?;
             }
-            Some(SyncCommand::FetchBody { message }) => {
-                apply_fetch_body(db, &mut conn, message, events).await?;
+            Some(SyncCommand::FetchBodies { messages }) => {
+                apply_fetch_bodies(db, &mut conn, account, messages, events).await?;
             }
             Some(SyncCommand::Send {
                 id,
                 message,
                 delete_draft,
             }) => {
-                send_message(
-                    db,
-                    &mut conn,
-                    smtp,
-                    password,
-                    account,
-                    id,
-                    *message,
-                    delete_draft,
-                    events,
-                )
-                .await;
+                tracing::info!(account = account.0, id, "sending composed message");
+                match credentials::for_account(db, &account_row, Purpose::Smtp).await {
+                    Ok(credential) => {
+                        send_message(
+                            db,
+                            &mut conn,
+                            smtp,
+                            &credential,
+                            account,
+                            id,
+                            *message,
+                            delete_draft,
+                            events,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        events
+                            .send(Event::SendResult {
+                                id,
+                                account,
+                                message_id: message.message_id.clone(),
+                                error: Some(error.to_string()),
+                            })
+                            .ok();
+                    }
+                }
             }
             Some(SyncCommand::SaveDraft {
                 id,
@@ -381,6 +471,29 @@ async fn run_session(
         }
         session = Some(conn);
     }
+}
+
+/// The newest Inbox messages that still need bodies, newest first, capped at
+/// [`PREFETCH_LIMIT`].
+fn prefetch_queue(db: &Db, account: AccountId) -> Vec<MessageId> {
+    let Ok(folders) = db.folders(account) else {
+        return Vec::new();
+    };
+    let Some(inbox) = folders
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+    else {
+        return Vec::new();
+    };
+    let Ok(messages) = db.messages_in_folder(inbox.id, PREFETCH_LIMIT) else {
+        return Vec::new();
+    };
+    messages
+        .into_iter()
+        .filter(|message| matches!(db.body_loaded(message.id), Ok(false)))
+        .map(|message| message.id)
+        .take(PREFETCH_LIMIT as usize)
+        .collect()
 }
 
 /// List folders, upsert them into the cache, and fetch headers for each from
@@ -420,11 +533,41 @@ async fn sync_all_folders(
     }
     events.send(Event::FoldersChanged { account }).ok();
 
+    // Drop cached folders the server no longer offers (for example Gmail's
+    // virtual All Mail / Important / Starred, which we no longer sync) so their
+    // duplicate messages stop showing up.
+    let keep: Vec<String> = server_folders
+        .iter()
+        .map(|folder| folder.path.clone())
+        .collect();
+    match db.retain_folders(account, &keep) {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(account = account.0, removed, "pruned stale mailboxes");
+            db.rethread_account(account)?;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(account = account.0, %error, "could not prune stale mailboxes");
+        }
+    }
+
     for server_folder in &server_folders {
         let Some(folder_id) = folder_ids.get(&server_folder.path) else {
             continue;
         };
-        sync_folder(db, session, account, *folder_id, &server_folder.path, 0).await?;
+        if let Err(error) =
+            sync_folder(db, session, account, *folder_id, &server_folder.path, 0).await
+        {
+            // One bad mailbox (e.g. a race with a server-side deletion) should
+            // not abort the whole account's first sync.
+            tracing::warn!(
+                account = account.0,
+                folder = %server_folder.path,
+                %error,
+                "skipping folder after sync error"
+            );
+            continue;
+        }
         events
             .send(Event::MessagesChanged {
                 account,
@@ -660,23 +803,58 @@ async fn apply_move_thread(
     Ok(())
 }
 
-async fn apply_fetch_body(
+/// Fetch and cache the bodies of several messages, batched per folder so a
+/// whole conversation costs one round trip per folder instead of one per
+/// message.
+async fn apply_fetch_bodies(
     db: &Db,
     session: &mut ImapSession,
-    message: MessageId,
+    account: AccountId,
+    messages: Vec<MessageId>,
     events: &mpsc::UnboundedSender<Event>,
 ) -> Result<()> {
-    let Some((account, path, folder_id, uid, _)) = db.message_location(message)? else {
-        return Ok(());
-    };
-    if db.get_message(message)?.and_then(|m| m.snippet.is_empty().then_some(())).is_none() {
-        // Body already cached.
-        return Ok(());
+    let mut by_folder: HashMap<String, Vec<(MessageId, u32)>> = HashMap::new();
+    for message in messages {
+        let Some((_account, path, _folder, uid, _)) = db.message_location(message)? else {
+            continue;
+        };
+        if db.body_loaded(message)? {
+            continue;
+        }
+        by_folder.entry(path).or_default().push((message, uid));
     }
-    let Some(raw) = session.fetch_full(&path, uid).await? else {
-        return Ok(());
-    };
-    let parsed = mail_parser::MessageParser::default().parse(&raw);
+
+    for (path, items) in by_folder {
+        let uids: Vec<u32> = items.iter().map(|(_, uid)| *uid).collect();
+        let bodies = match session.fetch_full_many(&path, &uids).await {
+            Ok(bodies) => bodies,
+            Err(error) => {
+                tracing::warn!(account = account.0, folder = %path, %error, "could not fetch message bodies");
+                continue;
+            }
+        };
+        for (uid, raw) in bodies {
+            let Some((message, _)) = items.iter().find(|(_, item_uid)| *item_uid == uid) else {
+                continue;
+            };
+            if let Err(error) = store_fetched_body(db, account, *message, &raw, events) {
+                tracing::warn!(account = account.0, %error, "could not store message body");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a fetched message, cache its text/HTML and attachment metadata, and
+/// tell the UI the body is ready.
+fn store_fetched_body(
+    db: &Db,
+    account: AccountId,
+    message: MessageId,
+    raw: &[u8],
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<()> {
+    let parsed = mail_parser::MessageParser::default().parse(raw);
     let text = parsed
         .as_ref()
         .and_then(|mail| mail.body_text(0))
@@ -723,7 +901,7 @@ async fn apply_fetch_body(
         .unwrap_or_default();
     db.set_attachments(message, &attachments)?;
     events
-        .send(Event::MessagesChanged { account, folder: folder_id })
+        .send(Event::BodyLoaded { account, message })
         .ok();
     Ok(())
 }
@@ -735,7 +913,7 @@ async fn send_message(
     db: &Db,
     session: &mut ImapSession,
     smtp_settings: &SmtpSettings,
-    password: &str,
+    credential: &Credential,
     account: AccountId,
     id: u64,
     mut message: OutgoingMessage,
@@ -747,7 +925,7 @@ async fn send_message(
         db,
         session,
         smtp_settings,
-        password,
+        credential,
         account,
         &mut message,
         delete_draft,
@@ -771,7 +949,7 @@ async fn deliver(
     db: &Db,
     session: &mut ImapSession,
     smtp_settings: &SmtpSettings,
-    password: &str,
+    credential: &Credential,
     account: AccountId,
     message: &mut OutgoingMessage,
     delete_draft: Option<DraftRef>,
@@ -785,7 +963,7 @@ async fn deliver(
 
     let built = message.build_message()?;
     let raw = built.formatted();
-    smtp::send(smtp_settings, password, built).await?;
+    smtp::send(smtp_settings, credential, built).await?;
 
     if let Some(draft) = delete_draft {
         // Best-effort: the message is already sent.

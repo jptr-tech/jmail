@@ -41,6 +41,8 @@ pub struct Ui {
     pub preview_row: Rc<RefCell<Option<MessageRow>>>,
     /// While set, selection changes do not trigger a reading-pane preview.
     pub suppress_preview: Rc<Cell<bool>>,
+    /// Coalesces bursts of body-arrived events into one reading-pane refresh.
+    pub preview_reload_pending: Rc<Cell<bool>>,
     /// Shown over the reading pane until a conversation is opened.
     pub reading_empty: adw::StatusPage,
     pub reading_subject: gtk::Label,
@@ -188,6 +190,7 @@ impl Ui {
             preview_generation,
             preview_row: Rc::new(RefCell::new(None)),
             suppress_preview: Rc::new(Cell::new(false)),
+            preview_reload_pending: Rc::new(Cell::new(false)),
             reading_empty: reading.empty,
             reading_subject: reading.subject,
             conversation: reading.conversation,
@@ -220,8 +223,46 @@ impl Ui {
         ui
     }
 
+    /// Discover accounts from GNOME Online Accounts, then start a sync worker
+    /// for every enabled account. Runs once per launch.
+    pub fn bootstrap_accounts(&self) {
+        self.refresh_accounts(true);
+    }
+
+    /// Reconcile GOA accounts with the cache, reload the folder pane, and start
+    /// any newly enabled accounts. `show_welcome` presents first-run onboarding
+    /// when reconciliation finishes.
+    pub fn refresh_accounts(&self, show_welcome: bool) {
+        let db = self.db.clone();
+        let before = db.account_count().unwrap_or(0);
+        let (tx, rx) = async_channel::bounded(1);
+        self.runtime.spawn(async move {
+            let result = jmail_core::goa::reconcile(&db).await;
+            let _ = tx.send(result).await;
+        });
+
+        let ui = self.clone();
+        gtk::glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(imported)) => tracing::debug!(imported, "account reconciliation complete"),
+                Ok(Err(error)) => tracing::warn!(%error, "could not reconcile Online Accounts"),
+                Err(_) => {}
+            }
+            // Only rebuild the folder pane when the set of accounts changed,
+            // so regaining focus does not reset the sidebar selection.
+            let after = ui.db.account_count().unwrap_or(before);
+            if after != before {
+                ui.reload_folders();
+            }
+            ui.start_enabled_accounts();
+            if show_welcome {
+                crate::welcome::maybe_show(&ui);
+            }
+        });
+    }
+
     /// Start a sync worker for every enabled account.
-    pub fn start_all_accounts(&self) {
+    pub fn start_enabled_accounts(&self) {
         let accounts = match self.db.accounts() {
             Ok(accounts) => accounts,
             Err(error) => {
@@ -229,7 +270,7 @@ impl Ui {
                 return;
             }
         };
-        for account in accounts {
+        for account in accounts.into_iter().filter(|account| account.enabled) {
             self.start_account(account.id);
         }
     }
@@ -253,6 +294,11 @@ impl Ui {
                 crate::actions::reload_preview(self);
                 self.maybe_open_pending_draft();
             }
+            Event::BodyLoaded { .. } => {
+                // The list itself did not change; only refresh the reading pane.
+                crate::actions::schedule_reload_preview(self);
+                self.maybe_open_pending_draft();
+            }
             Event::SyncStarted { .. } => {
                 self.status_label.set_text("Syncing…");
             }
@@ -274,7 +320,32 @@ impl Ui {
                 tracing::warn!(%message, "sync error");
                 self.status_label.set_text(&format!("Sync error: {message}"));
             }
+            Event::AccountsChanged => {
+                self.reset_view_if_disabled();
+                self.reload_folders();
+                self.reload_messages();
+            }
             Event::NewInboxMessage { .. } => {}
+        }
+    }
+
+    /// If the active folder belongs to a now-disabled account, fall back to the
+    /// Joined Inbox.
+    fn reset_view_if_disabled(&self) {
+        let ThreadFilter::Folder(id) = self.active_view.get() else {
+            return;
+        };
+        let disabled = self
+            .db
+            .folder(id)
+            .ok()
+            .flatten()
+            .and_then(|folder| self.db.account(folder.account_id).ok().flatten())
+            .map(|account| !account.enabled)
+            .unwrap_or(false);
+        if disabled {
+            self.active_view.set(ThreadFilter::Unified);
+            self.window_title.set_subtitle("Joined Inbox");
         }
     }
 
@@ -390,7 +461,18 @@ impl Ui {
         if previous_position != u32::MAX {
             let count = self.selection.n_items();
             if count > 0 {
-                self.select_quietly(previous_position.min(count - 1));
+                let position = previous_position.min(count - 1);
+                self.select_quietly(position);
+                // The open conversation was removed (deleted/moved): load the
+                // one that took its place, opening the pane in the narrow layout.
+                crate::actions::preview_after_removal(
+                    self,
+                    position,
+                    self.list_split.is_collapsed(),
+                );
+            } else {
+                // Nothing left in this view.
+                crate::actions::clear_preview(self);
             }
         }
     }
@@ -501,6 +583,16 @@ impl Ui {
                 crate::actions::preload_reading_pane(&ui);
             });
         }
+        // Pick up accounts added in GNOME Settings while the app was in the
+        // background (for example after the first-run welcome dialog).
+        {
+            let ui = self.clone();
+            self.window.connect_is_active_notify(move |window| {
+                if window.is_active() {
+                    ui.refresh_accounts(false);
+                }
+            });
+        }
     }
 }
 
@@ -598,7 +690,7 @@ fn populate_folders(content: &gtk::Box, db: &Db, ui: Option<&Ui>) {
             content.append(&empty);
         }
         Ok(accounts) => {
-            for account in &accounts {
+            for account in accounts.iter().filter(|account| account.enabled) {
                 let label = gtk::Label::builder()
                     .label(&account.email)
                     .xalign(0.0)

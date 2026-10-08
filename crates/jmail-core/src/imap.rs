@@ -2,18 +2,22 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_imap::types::{Fetch, NameAttribute};
 use async_imap::Client;
 use futures_util::StreamExt;
-use rustls_pki_types::ServerName;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-use crate::account::{AccountId, Security};
+use crate::account::{Account, AccountId, Security};
+use crate::credentials::Credential;
 use crate::error::{Error, Result};
 use crate::folder::{FolderId, SpecialUse};
 use crate::message::{Address, Flags, NewMessage};
@@ -45,6 +49,7 @@ pub struct ServerMessage {
 #[derive(Clone)]
 pub struct TlsTrust {
     roots: Arc<RootCertStore>,
+    insecure: bool,
 }
 
 impl TlsTrust {
@@ -54,7 +59,25 @@ impl TlsTrust {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         Ok(Self {
             roots: Arc::new(roots),
+            insecure: false,
         })
+    }
+
+    /// System roots, but skip certificate verification entirely. Only used when
+    /// the user has explicitly accepted an untrusted certificate.
+    pub fn accepting_invalid() -> Result<Self> {
+        let mut trust = Self::system()?;
+        trust.insecure = true;
+        Ok(trust)
+    }
+
+    /// The trust policy for an account.
+    pub fn for_account(account: &Account) -> Result<Self> {
+        if account.accept_invalid_certs {
+            Self::accepting_invalid()
+        } else {
+            Self::system()
+        }
     }
 
     /// System roots plus one pinned certificate (used to trust the mock server
@@ -62,17 +85,24 @@ impl TlsTrust {
     pub fn with_pinned(cert_der: &[u8]) -> Result<Self> {
         let mut pinned = (*Self::system()?.roots).clone();
         pinned
-            .add(rustls_pki_types::CertificateDer::from(cert_der.to_vec()))
+            .add(CertificateDer::from(cert_der.to_vec()))
             .map_err(|error| Error::Network(format!("bad pinned certificate: {error}")))?;
         Ok(Self {
             roots: Arc::new(pinned),
+            insecure: false,
         })
     }
 
     fn config(&self) -> ClientConfig {
-        ClientConfig::builder()
+        let mut config = ClientConfig::builder()
             .with_root_certificates((*self.roots).clone())
-            .with_no_client_auth()
+            .with_no_client_auth();
+        if self.insecure {
+            config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(NoCertificateVerification::new()));
+        }
+        config
     }
 }
 
@@ -80,7 +110,72 @@ impl fmt::Debug for TlsTrust {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsTrust")
             .field("roots", &self.roots.len())
+            .field("insecure", &self.insecure)
             .finish()
+    }
+}
+
+/// A certificate verifier that accepts any certificate. This is only installed
+/// when the user has explicitly confirmed an untrusted certificate for an
+/// account; all other connections use the normal verifier.
+#[derive(Debug)]
+struct NoCertificateVerification {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl NoCertificateVerification {
+    fn new() -> Self {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+        Self { provider }
+    }
+}
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -165,23 +260,35 @@ pub struct ImapSession {
 }
 
 impl ImapSession {
-    /// Connect and log in.
+    /// Connect and authenticate.
+    ///
+    /// The credential is accepted as anything convertible into a
+    /// [`Credential`], so callers can pass a bare password or an OAuth2 token.
     pub async fn connect(
         settings: ImapSettings,
-        password: &str,
+        credential: impl Into<Credential>,
         trust: &TlsTrust,
     ) -> Result<Self> {
+        let credential = credential.into();
         let tls_config = Arc::new(trust.config());
         let server_name = ServerName::try_from(settings.host.clone())
             .map_err(|error| Error::Network(format!("invalid server name {:?}: {error}", settings.host)))?;
+
+        tracing::debug!(
+            host = %settings.host,
+            port = settings.port,
+            security = ?settings.security,
+            "connecting to IMAP server"
+        );
 
         let mut session = match settings.security {
             Security::None => {
                 let tcp = TcpStream::connect((settings.host.as_str(), settings.port))
                     .await
                     .map_err(protocol)?;
-                let client = Client::new(StreamKind::Plain(tcp));
-                login(client, &settings.username, password).await?
+                let mut client = Client::new(StreamKind::Plain(tcp));
+                read_greeting(&mut client).await?;
+                authenticate(client, &settings.username, &credential).await?
             }
             Security::Tls => {
                 let tcp = TcpStream::connect((settings.host.as_str(), settings.port))
@@ -192,14 +299,16 @@ impl ImapSession {
                     .connect(server_name, tcp)
                     .await
                     .map_err(protocol)?;
-                let client = Client::new(StreamKind::Tls(tls));
-                login(client, &settings.username, password).await?
+                let mut client = Client::new(StreamKind::Tls(tls));
+                read_greeting(&mut client).await?;
+                authenticate(client, &settings.username, &credential).await?
             }
             Security::StartTls => {
                 let tcp = TcpStream::connect((settings.host.as_str(), settings.port))
                     .await
                     .map_err(protocol)?;
                 let mut client = Client::new(StreamKind::Plain(tcp));
+                // The greeting is consumed here, before the stream is upgraded.
                 client
                     .run_command_and_check_ok("STARTTLS", None)
                     .await
@@ -213,7 +322,7 @@ impl ImapSession {
                     .await
                     .map_err(protocol)?;
                 let client = Client::new(StreamKind::Tls(tls));
-                login(client, &settings.username, password).await?
+                authenticate(client, &settings.username, &credential).await?
             }
         };
 
@@ -246,10 +355,31 @@ impl ImapSession {
             } else {
                 SpecialUse::None
             };
+            let mut selectable = true;
+            let mut virtual_view = false;
             for attribute in name.attributes() {
+                if matches!(attribute, NameAttribute::NoSelect) {
+                    // Containers such as Gmail's `[Gmail]` and `Mailspring`
+                    // cannot be SELECTed and must not be synced.
+                    selectable = false;
+                }
+                if is_virtual_view(attribute) {
+                    // Gmail's Starred / Important re-list messages that are
+                    // already held in a real folder or All Mail; syncing them
+                    // only adds duplicates.
+                    virtual_view = true;
+                }
                 if let Some(use_) = special_use_of(attribute) {
                     special_use = use_;
                 }
+            }
+            if !selectable {
+                tracing::debug!(path = %name.name(), "skipping non-selectable mailbox");
+                continue;
+            }
+            if virtual_view {
+                tracing::debug!(path = %name.name(), "skipping virtual duplicate mailbox");
+                continue;
             }
             folders.push(ServerFolder {
                 path: name.name().to_string(),
@@ -285,23 +415,45 @@ impl ImapSession {
 
     /// Fetch a complete message by UID.
     pub async fn fetch_full(&mut self, path: &str, uid: u32) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .fetch_full_many(path, &[uid])
+            .await?
+            .into_iter()
+            .next()
+            .map(|(_, body)| body))
+    }
+
+    /// Fetch complete messages for several UIDs from one folder in a single
+    /// round trip (`UID FETCH uid1,uid2,… (BODY.PEEK[])`). Returns `(uid, body)`
+    /// pairs; UIDs the server no longer has are simply absent.
+    pub async fn fetch_full_many(
+        &mut self,
+        path: &str,
+        uids: &[u32],
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
         self.select(path).await?;
+        let set = uids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let stream = self
             .session
-            .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+            .uid_fetch(set, "(UID BODY.PEEK[])")
             .await
             .map_err(protocol)?;
-        // Drain the whole response stream: returning early would leave the
-        // tagged completion buffered and corrupt the next command.
-        let mut body = None;
+        let mut bodies = Vec::new();
         tokio::pin!(stream);
         while let Some(fetch) = stream.next().await {
             let fetch = fetch.map_err(protocol)?;
-            if body.is_none() {
-                body = fetch.body().map(|body| body.to_vec());
+            if let (Some(uid), Some(body)) = (fetch.uid, fetch.body()) {
+                bodies.push((uid, body.to_vec()));
             }
         }
-        Ok(body)
+        Ok(bodies)
     }
 
     /// Replace a message's flags on the server.
@@ -447,14 +599,91 @@ impl ImapSession {
     }
 }
 
-async fn login(
+/// How long to wait for the server's greeting after connecting.
+const GREETING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for authentication to complete.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Read and discard the server greeting.
+///
+/// Gmail (and other servers) announce themselves with an unsolicited `* OK`
+/// greeting. `async-imap`'s `authenticate` does not skip untagged responses, so
+/// without draining the greeting it reads it as the first SASL response and
+/// then waits forever for a tagged reply that never arrives. (This affects
+/// `AUTHENTICATE`; `LOGIN` tolerates the greeting.) See async-imap issue #84.
+async fn read_greeting(client: &mut Client<StreamKind>) -> Result<()> {
+    match tokio::time::timeout(GREETING_TIMEOUT, client.read_response()).await {
+        Ok(Ok(Some(_greeting))) => {
+            tracing::debug!("received IMAP server greeting");
+            Ok(())
+        }
+        Ok(Ok(None)) => Err(Error::Network(
+            "server closed the connection before sending its greeting".to_string(),
+        )),
+        Ok(Err(error)) => Err(protocol(error)),
+        Err(_) => Err(Error::Network(
+            "timed out waiting for the IMAP server greeting".to_string(),
+        )),
+    }
+}
+
+async fn authenticate(
     client: Client<StreamKind>,
     username: &str,
-    password: &str,
+    credential: &Credential,
 ) -> Result<Session> {
-    match client.login(username, password).await {
-        Ok(session) => Ok(session),
-        Err((_error, _client)) => Err(Error::Authentication(0)),
+    let attempt = async {
+        match credential {
+            Credential::Password(password) => client.login(username, password).await,
+            Credential::Bearer { token, .. } => {
+                client
+                    .authenticate("XOAUTH2", XOAuth2::new(username, token))
+                    .await
+            }
+        }
+    };
+    match tokio::time::timeout(AUTH_TIMEOUT, attempt).await {
+        Ok(Ok(session)) => {
+            tracing::debug!(user = username, "authenticated with IMAP server");
+            Ok(session)
+        }
+        Ok(Err((_error, _client))) => Err(Error::Authentication(0)),
+        Err(_) => Err(Error::Network(format!(
+            "timed out authenticating {username}; the server did not respond"
+        ))),
+    }
+}
+
+/// SASL `XOAUTH2` authenticator, as understood by Gmail and Outlook.
+struct XOAuth2 {
+    response: String,
+    sent: bool,
+}
+
+impl XOAuth2 {
+    fn new(username: &str, token: &str) -> Self {
+        Self {
+            response: format!("user={username}\x01auth=Bearer {token}\x01\x01"),
+            sent: false,
+        }
+    }
+}
+
+impl async_imap::Authenticator for XOAuth2 {
+    type Response = String;
+
+    fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+        // The first continuation is empty; reply with the initial response.
+        // If authentication fails the server follows with a base64 error
+        // challenge, which we acknowledge with an empty line so it can return
+        // the tagged NO.
+        if self.sent {
+            String::new()
+        } else {
+            self.sent = true;
+            self.response.clone()
+        }
     }
 }
 
@@ -468,6 +697,17 @@ fn special_use_of(attribute: &NameAttribute<'_>) -> Option<SpecialUse> {
         NameAttribute::Trash => SpecialUse::Trash,
         _ => return None,
     })
+}
+
+/// Whether a mailbox is a virtual view that duplicates messages held elsewhere:
+/// Gmail's `\Flagged` (Starred) and `\Important`. `\All` (All Mail) is *not*
+/// skipped — it is the only home of archived mail that carries no label.
+fn is_virtual_view(attribute: &NameAttribute<'_>) -> bool {
+    match attribute {
+        NameAttribute::Flagged => true,
+        NameAttribute::Extension(name) => name.eq_ignore_ascii_case("\\Important"),
+        _ => false,
+    }
 }
 
 fn protocol(error: impl fmt::Display) -> Error {
@@ -642,4 +882,28 @@ fn parse_date(value: Option<&str>) -> OffsetDateTime {
         .and_then(|value| mail_parser::DateTime::parse_rfc822(value))
         .and_then(|parsed| OffsetDateTime::from_unix_timestamp(parsed.to_timestamp()).ok())
         .unwrap_or_else(OffsetDateTime::now_utc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_imap::Authenticator;
+
+    #[test]
+    fn xoauth2_response_is_sasl_encoded() {
+        let mut auth = XOAuth2::new("you@example.com", "ya29.token");
+        assert_eq!(
+            auth.process(b""),
+            "user=you@example.com\x01auth=Bearer ya29.token\x01\x01"
+        );
+        // The server's error challenge is acknowledged with an empty response
+        // so it can return the tagged NO.
+        assert_eq!(auth.process(b"error"), "");
+    }
+
+    #[test]
+    fn credential_accepts_a_bare_password() {
+        let credential: Credential = "hunter2".into();
+        assert!(matches!(credential, Credential::Password(ref p) if p == "hunter2"));
+    }
 }

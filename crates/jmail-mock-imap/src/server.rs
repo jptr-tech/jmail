@@ -331,6 +331,38 @@ async fn handle_connection(socket: TcpStream, shared: Arc<Shared>) -> io::Result
                 let tls_stream = acceptor.accept(raw).await?;
                 stream = ServerStream::Tls(BufReader::new(tls_stream));
             }
+            "AUTHENTICATE" => {
+                let mechanism = command.split(' ').nth(1).unwrap_or("").to_uppercase();
+                if mechanism != "XOAUTH2" {
+                    no(&mut stream, &tag, "unsupported SASL mechanism").await?;
+                    continue;
+                }
+                // SASL continuation prompt, then the base64 client response.
+                write(&mut stream, "+ \r\n").await?;
+                stream.flush().await?;
+                let Some(response) = read_line(&mut stream).await? else {
+                    return Ok(());
+                };
+                let decoded = String::from_utf8_lossy(&base64_decode(&response)).to_string();
+                let expected_user = format!("user={}", shared.username);
+                let expected_token = format!("auth=Bearer {}", shared.password);
+                if decoded.contains(&expected_user) && decoded.contains(&expected_token) {
+                    state.authed = true;
+                    write(
+                        &mut stream,
+                        &format!(
+                            "{tag} OK [CAPABILITY IMAP4rev1 IDLE SPECIAL-USE MOVE UIDPLUS] Authenticated\r\n"
+                        ),
+                    )
+                    .await?;
+                } else {
+                    // Emulate Gmail's error challenge, then the caller's empty
+                    // acknowledgement line, before the tagged failure.
+                    write(&mut stream, "+ eyJzdGF0dXMiOiI0MDEifQ==\r\n").await?;
+                    let _ = read_line(&mut stream).await?;
+                    no(&mut stream, &tag, "[AUTHENTICATIONFAILED] bad token").await?;
+                }
+            }
             "LOGIN" => {
                 let mut parts = command.split(' ').skip(1);
                 let user = unquote(parts.next().unwrap_or(""));
@@ -871,6 +903,39 @@ async fn no(stream: &mut ServerStream, tag: &str, reason: &str) -> io::Result<()
 
 fn unquote(s: &str) -> String {
     s.trim().trim_matches('"').replace("\\\"", "\"")
+}
+
+/// Decode standard base64 (used for the SASL `XOAUTH2` response). Invalid input
+/// decodes to an empty vector; the caller then rejects it.
+fn base64_decode(input: &str) -> Vec<u8> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut accumulator = 0u32;
+    let mut bits = 0u32;
+    for &byte in input.trim().as_bytes() {
+        if byte == b'=' || byte == b'\r' || byte == b'\n' {
+            continue;
+        }
+        let Some(v) = value(byte) else {
+            return Vec::new();
+        };
+        accumulator = (accumulator << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+        }
+    }
+    out
 }
 
 /// Generate a throwaway self-signed certificate for the mock server.

@@ -98,6 +98,13 @@ pub struct Account {
     /// Accent colour (hex, e.g. `#3584e4`) used for the account chip in the UI.
     pub color: String,
     pub enabled: bool,
+    /// D-Bus object path of the backing GNOME Online Accounts account, if this
+    /// account is provided by GOA rather than configured manually. It is the
+    /// key used to reconcile the local row against the system account.
+    pub goa_object_path: Option<String>,
+    /// Skip TLS certificate validation for this account's servers. Set only
+    /// after the user explicitly accepts an untrusted certificate.
+    pub accept_invalid_certs: bool,
 }
 
 impl Account {
@@ -120,6 +127,8 @@ impl Account {
             smtp_security: Security::Tls,
             color: "#3584e4".to_string(),
             enabled: true,
+            goa_object_path: None,
+            accept_invalid_certs: false,
         }
     }
 
@@ -142,6 +151,8 @@ impl Account {
             smtp_security: Security::Tls,
             color: "#e5a50a".to_string(),
             enabled: true,
+            goa_object_path: None,
+            accept_invalid_certs: false,
         }
     }
 }

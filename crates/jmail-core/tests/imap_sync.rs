@@ -56,6 +56,71 @@ async fn connects_over_starttls() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skips_non_selectable_mailboxes() {
+    // Gmail advertises container mailboxes such as `[Gmail]` with `\Noselect`.
+    // They cannot be SELECTed, so they must not be returned as syncable
+    // folders (doing so used to abort the whole account's first sync).
+    let mut mailbox = MockMailbox::demo();
+    mailbox.add_folder("Container", &["\\HasChildren", "\\Noselect"]);
+    let server = MockServer::start(MockConfig::new("you@example.com", "hunter2"), mailbox)
+        .await
+        .expect("start mock server");
+
+    let mut session = ImapSession::connect(
+        settings(server.addr().port(), Security::None),
+        "hunter2",
+        &TlsTrust::system().unwrap(),
+    )
+    .await
+    .expect("connect");
+
+    let folders = session.list_folders().await.expect("list");
+    assert!(
+        !folders.iter().any(|folder| folder.path == "Container"),
+        "non-selectable mailbox should be skipped: {folders:?}"
+    );
+    assert!(folders.iter().any(|folder| folder.special_use == SpecialUse::Inbox));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skips_virtual_duplicate_mailboxes() {
+    // Gmail's Starred / Important re-list messages already held in real folders.
+    // All Mail is kept, because it is the only home of archived unlabelled mail.
+    let mut mailbox = MockMailbox::demo();
+    mailbox.add_folder("All Mail", &["\\All", "\\HasNoChildren"]);
+    mailbox.add_folder("Starred", &["\\Flagged", "\\HasNoChildren"]);
+    mailbox.add_folder("Important", &["\\Important", "\\HasNoChildren"]);
+    let server = MockServer::start(MockConfig::new("you@example.com", "hunter2"), mailbox)
+        .await
+        .expect("start mock server");
+
+    let mut session = ImapSession::connect(
+        settings(server.addr().port(), Security::None),
+        "hunter2",
+        &TlsTrust::system().unwrap(),
+    )
+    .await
+    .expect("connect");
+
+    let folders = session.list_folders().await.expect("list");
+    for name in ["Starred", "Important"] {
+        assert!(
+            !folders.iter().any(|folder| folder.path == name),
+            "virtual mailbox {name} should be skipped: {folders:?}"
+        );
+    }
+    assert!(
+        folders.iter().any(|folder| folder.path == "All Mail"),
+        "All Mail must be kept so archived unlabelled mail is not lost"
+    );
+    assert!(folders.iter().any(|folder| folder.special_use == SpecialUse::Inbox));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn syncs_headers_and_flags() {
     let server = start_server(true).await;
     let cert = server.cert_der().unwrap().to_vec();
@@ -132,6 +197,103 @@ async fn parses_html_alternative_body() {
     assert!(parsed
         .body_text(0)
         .is_some_and(|text| text.contains("first message")));
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetches_multiple_bodies_in_one_batch() {
+    let server = start_server(false).await;
+    let mut session = ImapSession::connect(
+        settings(server.addr().port(), Security::None),
+        "hunter2",
+        &TlsTrust::system().unwrap(),
+    )
+    .await
+    .unwrap();
+    let folders = session.list_folders().await.unwrap();
+    let inbox = folders
+        .iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let headers = session.fetch_headers(&inbox.path, 0).await.unwrap();
+    assert_eq!(headers.len(), 5);
+    let uids: Vec<u32> = headers.iter().map(|message| message.uid).collect();
+
+    let bodies = session.fetch_full_many(&inbox.path, &uids).await.unwrap();
+    assert_eq!(bodies.len(), 5, "one batch should return every body");
+
+    let welcome_uid = headers
+        .iter()
+        .find(|message| message.new.subject == "Welcome to Jmail")
+        .map(|message| message.uid)
+        .unwrap();
+    let raw = bodies
+        .iter()
+        .find(|(uid, _)| *uid == welcome_uid)
+        .map(|(_, body)| body)
+        .unwrap();
+    assert!(String::from_utf8_lossy(raw).contains("first message"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_prefetch_warms_inbox_bodies() {
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    // Wait for the initial sync.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let inbox = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+
+    // Prefetch starts a few seconds after entering IDLE; the whole 5-message
+    // Inbox fits in the first batch.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let loaded = db
+            .messages_in_folder(inbox.id, 100)
+            .unwrap()
+            .iter()
+            .all(|message| db.body_loaded(message.id).unwrap());
+        if loaded {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "background prefetch did not warm the Inbox in time"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
     server.shutdown().await;
 }
 
@@ -394,8 +556,8 @@ async fn engine_extracts_attachment_metadata() {
 
     engine.send(
         account,
-        SyncCommand::FetchBody {
-            message: report.id,
+        SyncCommand::FetchBodies {
+            messages: vec![report.id],
         },
     );
 
@@ -760,7 +922,9 @@ async fn engine_saves_replaces_and_sends_drafts() {
 
     engine.send(
         account,
-        SyncCommand::FetchBody { message: stored.id },
+        SyncCommand::FetchBodies {
+            messages: vec![stored.id],
+        },
     );
     wait_until(&mut events, Duration::from_secs(10), || {
         db.message_body(stored.id)

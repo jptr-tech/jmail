@@ -59,3 +59,12 @@
   border-radius: 6px;
   padding: 4px 8px;
 }
+
+/* Account connection-test result. */
+.result-success {
+  color: @success_color;
+}
+
+.result-error {
+  color: @error_color;
+}
