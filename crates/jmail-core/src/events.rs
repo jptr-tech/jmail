@@ -27,11 +27,13 @@ pub enum Event {
         account: AccountId,
         message: MessageId,
     },
-    /// An attachment finished saving to disk (or failed).
+    /// An attachment finished saving to disk (or failed). `open` means the file
+    /// was fetched for immediate viewing rather than as a saved copy.
     AttachmentSaved {
         message: MessageId,
         part: u32,
         path: PathBuf,
+        open: bool,
         error: Option<String>,
     },
     /// A new message arrived in the Inbox and should be considered for a
@@ -55,6 +57,13 @@ pub enum Event {
         account: AccountId,
         draft: Option<DraftRef>,
         error: Option<String>,
+    },
+    /// A queued (optimistic) operation ultimately failed and its cache change
+    /// was rolled back. `message` is the conversation it affected.
+    OpFailed {
+        account: AccountId,
+        message: MessageId,
+        error: String,
     },
     /// The set of accounts (or their enabled state) changed and the UI should
     /// rebuild the folder pane and message list.

@@ -58,6 +58,9 @@ pub struct Ui {
     folder_rows: Rc<RefCell<Vec<(ThreadFilter, adw::ActionRow)>>>,
     /// Whether HTML bodies may load remote images (reading setting).
     pub remote_images: Rc<Cell<bool>>,
+    /// Whether message bodies ignore the sender's colours and follow the app
+    /// theme instead (reading setting).
+    pub readable_colors: Rc<Cell<bool>>,
     /// Result handlers for open compose windows, keyed by correlation id.
     pub compose_replies: Rc<RefCell<HashMap<u64, Rc<dyn Fn(crate::compose::ComposeOutcome)>>>>,
     next_compose_id: Rc<Cell<u64>>,
@@ -72,14 +75,24 @@ impl Ui {
         engine: SyncEngine,
         runtime: tokio::runtime::Handle,
     ) -> Self {
-        let status_label = gtk::Label::builder().label("Ready").xalign(0.0).build();
+        let status_label = gtk::Label::builder()
+            .label("Ready")
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .hexpand(true)
+            .build();
         status_label.add_css_class("dim-label");
         status_label.add_css_class("caption");
 
         let remote_images = Rc::new(Cell::new(crate::prefs::get_bool(
             &db,
             crate::prefs::REMOTE_IMAGES,
-            false,
+            true,
+        )));
+        let readable_colors = Rc::new(Cell::new(crate::prefs::get_bool(
+            &db,
+            crate::prefs::READABLE_COLORS,
+            true,
         )));
 
         let (header, search_toggle, window_title) = build_header();
@@ -188,6 +201,7 @@ impl Ui {
             active_view: Rc::new(Cell::new(ThreadFilter::Unified)),
             folder_rows: Rc::new(RefCell::new(Vec::new())),
             remote_images,
+            readable_colors,
             compose_replies: Rc::new(RefCell::new(HashMap::new())),
             next_compose_id: Rc::new(Cell::new(0)),
             pending_draft: Rc::new(RefCell::new(None)),
@@ -209,6 +223,16 @@ impl Ui {
                     _ => return,
                 };
                 let _ = gtk::prelude::WidgetExt::activate_action(&window, action, None);
+            }));
+        }
+
+        // Attachment chips inside a rendered body call back here; the fetch and
+        // open/save routing lives in `actions`.
+        {
+            let reading = ui.reading.clone();
+            let handle = ui.clone();
+            reading.set_on_attachment(Rc::new(move |message, part, save| {
+                crate::actions::handle_attachment(&handle, MessageId(message), part, save);
             }));
         }
 
@@ -329,9 +353,17 @@ impl Ui {
                 self.reload_messages();
             }
             Event::NewInboxMessage { .. } => {}
-            Event::AttachmentSaved { path, error, .. } => {
+            Event::AttachmentSaved {
+                path, open, error, ..
+            } => {
+                // Opening hands straight off to the default viewer.
+                if open && error.is_none() {
+                    crate::actions::open_file(&path);
+                    return;
+                }
                 let toast = if let Some(error) = error {
-                    let toast = adw::Toast::new(&format!("Could not save attachment: {error}"));
+                    let verb = if open { "open" } else { "save" };
+                    let toast = adw::Toast::new(&format!("Could not {verb} attachment: {error}"));
                     toast.set_timeout(5);
                     toast
                 } else {
@@ -347,6 +379,13 @@ impl Ui {
                     });
                     toast
                 };
+                self.toast_overlay.add_toast(toast);
+            }
+            Event::OpFailed { error, .. } => {
+                // The engine rolled back an optimistic change; refresh and say so.
+                crate::actions::schedule_messages_reload(self);
+                let toast = adw::Toast::new(&format!("Couldn't complete the change: {error}"));
+                toast.set_timeout(5);
                 self.toast_overlay.add_toast(toast);
             }
         }
@@ -405,6 +444,13 @@ impl Ui {
         self.reading.clear_inline(self);
     }
 
+    /// Show a transient toast in the main window.
+    pub fn toast(&self, message: &str) {
+        let toast = adw::Toast::new(message);
+        toast.set_timeout(5);
+        self.toast_overlay.add_toast(toast);
+    }
+
     /// Scroll the reading pane to the bottom (to reveal an inline composer).
     pub fn scroll_reading_to_bottom(&self) {
         self.reading.scroll_to_bottom();
@@ -448,7 +494,12 @@ impl Ui {
         self.remote_images.set(crate::prefs::get_bool(
             &self.db,
             crate::prefs::REMOTE_IMAGES,
-            false,
+            true,
+        ));
+        self.readable_colors.set(crate::prefs::get_bool(
+            &self.db,
+            crate::prefs::READABLE_COLORS,
+            true,
         ));
         crate::actions::reload_preview(self);
     }

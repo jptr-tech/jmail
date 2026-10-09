@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use jmail_core::imap::{ImapSession, ImapSettings, TlsTrust};
 use jmail_core::message::Flags;
-use jmail_core::{Account, Db, MoveTarget, Security, SpecialUse, SyncCommand, SyncEngine};
+use jmail_core::{Account, Db, Folder, FolderId, MoveTarget, Security, SpecialUse, SyncCommand, SyncEngine};
 use jmail_mock_imap::{MockConfig, MockMailbox, MockMessage, MockServer};
 
 fn settings(port: u16, security: Security) -> ImapSettings {
@@ -470,6 +470,212 @@ async fn engine_moves_thread_to_named_folder() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_flushes_optimistic_move_from_outbox() {
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let folders = db.folders(account).unwrap();
+    let inbox = folders
+        .iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let projects = folders
+        .iter()
+        .find(|folder| folder.name == "Projects")
+        .expect("mock has a Projects folder");
+    let report = db
+        .messages_in_folder(inbox.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.subject == "Quarterly report")
+        .expect("quarterly report in inbox");
+
+    // Queue the move optimistically, exactly as the UI does.
+    let messages: Vec<jmail_core::QueuedMessage> = db
+        .thread_locations(account, &report.thread_id)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, folder, ..)| *folder == inbox.id)
+        .map(|(id, folder, path, uid, flags)| jmail_core::QueuedMessage {
+            message_id: id.0,
+            folder_id: folder.0,
+            path,
+            uid,
+            flags: flags.to_i64(),
+        })
+        .collect();
+    db.enqueue_op(
+        account,
+        &jmail_core::OpPayload::Move {
+            target: Some(projects.id.0),
+            messages,
+        },
+    )
+    .unwrap();
+    assert!(db.has_pending_ops(account).unwrap());
+    assert!(
+        db.messages_in_folder(inbox.id, 100)
+            .unwrap()
+            .iter()
+            .all(|message| message.id != report.id),
+        "the move should already be reflected in the cache"
+    );
+
+    engine.send(account, SyncCommand::FlushOutbox);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while db.has_pending_ops(account).unwrap() {
+        tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("outbox flush before deadline")
+            .expect("channel open");
+    }
+    assert!(
+        db.messages_in_folder(projects.id, 100)
+            .unwrap()
+            .iter()
+            .any(|message| message.subject == "Quarterly report"),
+        "the moved message should be in the destination after the server move"
+    );
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_rolls_back_and_reports_a_failed_outbox_op() {
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let folders = db.folders(account).unwrap();
+    let inbox = folders
+        .iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    let report = db
+        .messages_in_folder(inbox.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.subject == "Quarterly report")
+        .expect("quarterly report in inbox");
+
+    // A folder that belongs to a different account is FK-valid but invisible to
+    // this account, so the engine treats the move as a hard failure.
+    let other = db
+        .insert_account(&Account::generic("other@example.com"))
+        .unwrap();
+    let other_folder = db
+        .upsert_folder(&Folder {
+            id: FolderId(0),
+            account_id: other,
+            name: "Other".to_string(),
+            path: "Other".to_string(),
+            special_use: SpecialUse::None,
+            unread: 0,
+            total: 0,
+            uidvalidity: 0,
+            uidnext: 0,
+            last_uid: 0,
+        })
+        .unwrap();
+    let messages: Vec<jmail_core::QueuedMessage> = db
+        .thread_locations(account, &report.thread_id)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, folder, ..)| *folder == inbox.id)
+        .map(|(id, folder, path, uid, flags)| jmail_core::QueuedMessage {
+            message_id: id.0,
+            folder_id: folder.0,
+            path,
+            uid,
+            flags: flags.to_i64(),
+        })
+        .collect();
+    db.enqueue_op(
+        account,
+        &jmail_core::OpPayload::Move {
+            target: Some(other_folder.0),
+            messages,
+        },
+    )
+    .unwrap();
+
+    engine.send(account, SyncCommand::FlushOutbox);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::OpFailed { .. }) {
+            break;
+        }
+    }
+    assert!(!db.has_pending_ops(account).unwrap());
+    assert!(
+        db.messages_in_folder(inbox.id, 100)
+            .unwrap()
+            .iter()
+            .any(|message| message.id == report.id),
+        "a rolled-back move should leave the message in the inbox"
+    );
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_applies_thread_wide_flags() {
     let server = start_server(false).await;
     let db = Db::open_in_memory().unwrap();
@@ -721,6 +927,7 @@ async fn engine_saves_attachment_to_disk() {
             message: report.id,
             part: 0,
             destination: destination.clone(),
+            open: false,
         },
     );
 
@@ -730,8 +937,9 @@ async fn engine_saves_attachment_to_disk() {
             .await
             .expect("event before deadline")
             .expect("channel open");
-        if let jmail_core::events::Event::AttachmentSaved { error, .. } = event {
+        if let jmail_core::events::Event::AttachmentSaved { error, open, .. } = event {
             assert!(error.is_none(), "save failed: {error:?}");
+            assert!(!open, "a save request must not be marked for opening");
             break;
         }
     }

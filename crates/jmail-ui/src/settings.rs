@@ -923,13 +923,13 @@ fn reading_page() -> adw::PreferencesPage {
     let db = crate::context::get().map(|context| context.db.clone());
 
     let remote = adw::SwitchRow::builder()
-        .title("Load remote images")
-        .subtitle("Allow tracking pixels to load automatically")
+        .title("Load remote content")
+        .subtitle("Show images and other remote content — may let senders track when you read them")
         .build();
     remote.set_active(
         db.as_ref()
-            .map(|db| crate::prefs::get_bool(db, crate::prefs::REMOTE_IMAGES, false))
-            .unwrap_or(false),
+            .map(|db| crate::prefs::get_bool(db, crate::prefs::REMOTE_IMAGES, true))
+            .unwrap_or(true),
     );
     if let Some(db) = db.clone() {
         remote.connect_active_notify(move |row| {
@@ -939,6 +939,24 @@ fn reading_page() -> adw::PreferencesPage {
         });
     }
     group.add(&remote);
+
+    let readable = adw::SwitchRow::builder()
+        .title("Force readable message colors")
+        .subtitle("Ignore colours chosen by the sender so text always contrasts with the theme")
+        .build();
+    readable.set_active(
+        db.as_ref()
+            .map(|db| crate::prefs::get_bool(db, crate::prefs::READABLE_COLORS, true))
+            .unwrap_or(true),
+    );
+    if let Some(db) = db.clone() {
+        readable.connect_active_notify(move |row| {
+            crate::prefs::set_bool(&db, crate::prefs::READABLE_COLORS, row.is_active());
+            // Re-render the open conversation so the change is visible at once.
+            crate::context::refresh_reading();
+        });
+    }
+    group.add(&readable);
 
     page.add(&group);
     page

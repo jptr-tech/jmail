@@ -71,6 +71,9 @@ struct Composer {
     message_id: Rc<RefCell<String>>,
     draft: Rc<RefCell<Option<DraftRef>>>,
     target: Option<Message>,
+    /// Dismisses the composer's container (dialog / inline slot) on submit so
+    /// sending never blocks the UI; failures re-present it.
+    on_submit: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 }
 
 impl Composer {
@@ -255,6 +258,7 @@ impl Composer {
             ))),
             draft: Rc::new(RefCell::new(draft_ref)),
             target,
+            on_submit: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -303,6 +307,13 @@ impl Composer {
 
     fn focus_editor(&self) {
         self.editor.focus();
+    }
+
+    /// Install the callback that dismisses this composer's container on submit
+    /// (closing the dialog / removing the inline slot) so sending is
+    /// non-blocking. A send failure re-presents the composer.
+    fn set_on_submit(&self, callback: Rc<dyn Fn()>) {
+        *self.on_submit.borrow_mut() = Some(callback);
     }
 
     fn build_outgoing(&self, account: &Account) -> OutgoingMessage {
@@ -365,6 +376,10 @@ impl Composer {
                 delete_draft,
             },
         );
+        // Dismiss immediately: the Sent copy and any error arrive via events.
+        if let Some(callback) = self.on_submit.borrow().clone() {
+            callback();
+        }
     }
 
     fn save_draft(&self, ui: &Ui) {
@@ -464,25 +479,42 @@ pub fn present_in(
     }
     composer.actions.insert_child_after(&cancel, Some(&composer.preview));
 
+    // Submitting dismisses the dialog right away (sending is non-blocking).
+    {
+        let dialog = dialog.clone();
+        composer.set_on_submit(Rc::new(move || {
+            dialog.close();
+        }));
+    }
+
     {
         let ui = ui.clone();
         let composer = composer.clone();
         let dialog = dialog.clone();
+        let parent: gtk::Widget = parent.clone().upcast();
         ui.clone().register_compose_handler(
             composer.id,
-            Rc::new(move |outcome| {
-                if let ComposeOutcome::Send { error: None } = &outcome {
+            Rc::new(move |outcome| match outcome {
+                ComposeOutcome::Send { error: None } => {
                     ui.unregister_compose(composer.id);
                     dialog.close();
                     ui.status_label.set_text("Message sent");
-                    return;
+                    ui.reload_messages();
                 }
-                composer.handle_outcome(&ui, outcome);
+                ComposeOutcome::Send { error: Some(error) } => {
+                    // Re-present so the content is not lost and can be retried.
+                    composer.send.set_sensitive(true);
+                    composer.set_error(&format!("Send failed: {error}"));
+                    ui.status_label.set_text(&format!("Send failed: {error}"));
+                    ui.toast(&format!("Send failed: {error}"));
+                    dialog.present(Some(&parent));
+                }
+                other => composer.handle_outcome(&ui, other),
             }),
         );
     }
 
-    // Save unsent content when the dialog is dismissed.
+    // Save unsent content when the dialog is dismissed (but not while sending).
     {
         let ui = ui.clone();
         let composer = composer.clone();
@@ -495,8 +527,12 @@ pub fn present_in(
     {
         let ui = ui.clone();
         let id = composer.id;
+        let composer = composer.clone();
         dialog.connect_closed(move |_| {
-            ui.unregister_compose(id);
+            // Keep the result handler alive while a send is in flight.
+            if composer.send.is_sensitive() {
+                ui.unregister_compose(id);
+            }
         });
     }
 
@@ -521,22 +557,37 @@ pub fn present_inline(
     composer.wire(ui);
     pane.set_inline_composer(composer.id);
 
+    // Submitting detaches the composer right away (sending is non-blocking).
+    {
+        let pane = pane.clone();
+        composer.set_on_submit(Rc::new(move || pane.detach_inline()));
+    }
+
     {
         let ui = ui.clone();
         let composer = composer.clone();
         let pane = pane.clone();
         ui.clone().register_compose_handler(
             composer.id,
-            Rc::new(move |outcome| {
-                if let ComposeOutcome::Send { error: None } = &outcome {
-                    pane.clear_inline(&ui);
+            Rc::new(move |outcome| match outcome {
+                ComposeOutcome::Send { error: None } => {
                     ui.unregister_compose(composer.id);
                     ui.status_label.set_text("Message sent");
                     ui.reload_messages();
                     crate::actions::reload_preview(&ui);
-                    return;
                 }
-                composer.handle_outcome(&ui, outcome);
+                ComposeOutcome::Send { error: Some(error) } => {
+                    composer.send.set_sensitive(true);
+                    composer.set_error(&format!("Send failed: {error}"));
+                    ui.status_label.set_text(&format!("Send failed: {error}"));
+                    ui.toast(&format!("Send failed: {error}"));
+                    // Put the composer back where it was so it can be retried.
+                    pane.compose_slot.append(&composer.root);
+                    pane.reply_bar.set_visible(false);
+                    pane.set_inline_composer(composer.id);
+                    pane.scroll_to_bottom();
+                }
+                other => composer.handle_outcome(&ui, other),
             }),
         );
     }

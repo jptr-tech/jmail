@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use time::OffsetDateTime;
 
 use crate::account::AccountId;
-use crate::cache::Db;
+use crate::cache::{Db, OpPayload, PendingOp};
 use crate::credentials::{self, Credential, Purpose};
 use crate::error::{Error, Result};
 use crate::events::Event;
@@ -28,6 +29,9 @@ const PREFETCH_CHUNK: usize = 5;
 const PREFETCH_COOLDOWN: Duration = Duration::from_secs(5);
 /// Let the initial sync settle before background prefetch starts.
 const PREFETCH_START_DELAY: Duration = Duration::from_secs(5);
+/// How long a queued operation keeps retrying transient failures before the
+/// engine rolls it back locally.
+const OP_FAIL_WINDOW: Duration = Duration::from_secs(60);
 
 /// Where a conversation should be moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,13 +62,18 @@ pub enum SyncCommand {
     /// Move every message of the conversation (those in the representative's
     /// folder) to another folder.
     MoveThread { message: MessageId, to: MoveTarget },
+    /// Apply any queued (optimistic) operations for this account now.
+    FlushOutbox,
     /// Fetch and cache message bodies (batched per folder).
     FetchBodies { messages: Vec<MessageId> },
     /// Fetch a message and save one of its MIME attachments to a local path.
+    /// `open` asks the UI to hand the file to the default viewer instead of
+    /// treating it as a "saved" copy.
     FetchAttachment {
         message: MessageId,
         part: u32,
         destination: PathBuf,
+        open: bool,
     },
     /// Send a composed message and append a copy to Sent.
     Send {
@@ -336,11 +345,25 @@ async fn run_session(
         handle.init().await.map_err(protocol)?;
         let deadline = tokio::time::Instant::now() + poll_interval;
         let mut prefetch_now = false;
+        let mut outbox_now = false;
+        // Queued (optimistic) operations take priority: wake immediately if one
+        // is due, otherwise sleep until the next scheduled retry.
+        let pending = db.pending_ops(account).unwrap_or_default();
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+        let outbox_due = pending.iter().any(|op| op.next_attempt <= now_secs);
+        let outbox_wait = pending
+            .iter()
+            .filter(|op| op.next_attempt > now_secs)
+            .map(|op| (op.next_attempt - now_secs) as u64)
+            .min();
         let got_command = if first_idle {
             // Mail that arrived between the initial sync and the IDLE
             // subscription would be missed until the next poll, so resync once
             // right after entering IDLE.
             first_idle = false;
+            None
+        } else if outbox_due {
+            outbox_now = true;
             None
         } else {
             loop {
@@ -369,13 +392,37 @@ async fn run_session(
                         prefetch_now = true;
                         break None;
                     }
+                    _ = tokio::time::sleep(Duration::from_secs(outbox_wait.unwrap_or(3600))), if outbox_wait.is_some() => {
+                        outbox_now = true;
+                        break None;
+                    }
                 }
             }
         };
         let raw = handle.done().await.map_err(protocol)?;
         let mut conn = ImapSession::from_session(raw, settings.clone(), supports_move);
 
+        // Confirm or roll back queued operations before anything slower.
+        if !pending.is_empty()
+            || outbox_now
+            || matches!(&got_command, Some(SyncCommand::FlushOutbox))
+        {
+            if let Err(error) = flush_outbox(db, &mut conn, account, events).await {
+                tracing::warn!(account = account.0, %error, "outbox flush failed");
+            }
+            if outbox_now {
+                session = Some(conn);
+                continue;
+            }
+        }
+
         if prefetch_now {
+            if db.has_pending_ops(account).unwrap_or(false) {
+                // Let queued user actions go first; try prefetch again later.
+                next_prefetch = tokio::time::Instant::now() + PREFETCH_COOLDOWN;
+                session = Some(conn);
+                continue;
+            }
             let count = prefetch.len().min(PREFETCH_CHUNK);
             let chunk: Vec<MessageId> = prefetch.drain(..count).collect();
             if let Err(error) = apply_fetch_bodies(db, &mut conn, account, chunk, events).await {
@@ -407,7 +454,8 @@ async fn run_session(
                         .folder(folder_id)?
                         .map(|folder| folder.last_uid)
                         .unwrap_or(0);
-                    sync_folder(db, &mut conn, account, folder_id, &path, last_uid).await?;
+                    sync_folder_inner(db, &mut conn, account, folder_id, &path, last_uid, false)
+                        .await?;
                     events
                         .send(Event::MessagesChanged {
                             account,
@@ -415,6 +463,8 @@ async fn run_session(
                         })
                         .ok();
                 }
+                // One rebuild for the whole pass, after every folder is in.
+                db.rethread_account(account)?;
             }
             Some(SyncCommand::SetFlags { message, flags }) => {
                 apply_flags(db, &mut conn, account, message, flags, events).await?;
@@ -439,6 +489,8 @@ async fn run_session(
             Some(SyncCommand::MoveThread { message, to }) => {
                 apply_move_thread(db, &mut conn, message, to, events).await?;
             }
+            // Already flushed above, before prefetch.
+            Some(SyncCommand::FlushOutbox) => {}
             Some(SyncCommand::FetchBodies { messages }) => {
                 apply_fetch_bodies(db, &mut conn, account, messages, events).await?;
             }
@@ -446,8 +498,10 @@ async fn run_session(
                 message,
                 part,
                 destination,
+                open,
             }) => {
-                apply_fetch_attachment(db, &mut conn, message, part, destination, events).await?;
+                apply_fetch_attachment(db, &mut conn, message, part, destination, open, events)
+                    .await?;
             }
             Some(SyncCommand::Send {
                 id,
@@ -586,7 +640,7 @@ async fn sync_all_folders(
             continue;
         };
         if let Err(error) =
-            sync_folder(db, session, account, *folder_id, &server_folder.path, 0).await
+            sync_folder_inner(db, session, account, *folder_id, &server_folder.path, 0, false).await
         {
             // One bad mailbox (e.g. a race with a server-side deletion) should
             // not abort the whole account's first sync.
@@ -618,6 +672,23 @@ async fn sync_folder(
     folder_id: crate::folder::FolderId,
     path: &str,
     since_uid: u32,
+) -> Result<()> {
+    sync_folder_inner(db, session, account, folder_id, path, since_uid, true).await
+}
+
+/// Like [`sync_folder`], but `rethread` can be switched off when the caller is
+/// batching several folders and rebuilds conversations once at the end (the
+/// initial sync). Rebuilding after every folder is O(messages) each time and
+/// holds the shared cache lock, which is what makes the UI stutter during
+/// startup sync; one rebuild per pass is enough.
+async fn sync_folder_inner(
+    db: &Db,
+    session: &mut ImapSession,
+    account: AccountId,
+    folder_id: crate::folder::FolderId,
+    path: &str,
+    since_uid: u32,
+    rethread: bool,
 ) -> Result<()> {
     let mailbox = session.select(path).await?;
     let cached = db.folder(folder_id)?;
@@ -652,8 +723,9 @@ async fn sync_folder(
         inserted = true;
     }
     // New headers can link previously-separate conversations, so rebuild the
-    // account's thread assignment whenever anything changed.
-    if inserted {
+    // account's thread assignment whenever anything changed. Callers batching
+    // folders pass `rethread = false` and rebuild once at the end.
+    if inserted && rethread {
         db.rethread_account(account)?;
     }
     let unread = count_unread(db, folder_id)?;
@@ -849,6 +921,153 @@ async fn apply_move_thread(
     Ok(())
 }
 
+/// Backoff (seconds) before retrying a transiently failed queued op.
+fn op_backoff(attempts: i64) -> i64 {
+    match attempts {
+        0 => 1,
+        1 => 2,
+        2 => 5,
+        3 => 15,
+        _ => 30,
+    }
+}
+
+/// Whether a failure is permanent (roll back now rather than keep retrying).
+fn is_hard_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::FolderNotFound(_)
+            | Error::MessageNotFound(_)
+            | Error::Config(_)
+            | Error::Authentication(_)
+            | Error::Unimplemented
+    )
+}
+
+/// Apply the queued (optimistically cached) operations for `account`, retrying
+/// transient failures and rolling back anything that ultimately fails. This is
+/// what makes archive/delete/move feel instant: the cache already reflects them,
+/// so the only work left is confirming them on the server.
+async fn flush_outbox(
+    db: &Db,
+    session: &mut ImapSession,
+    account: AccountId,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<()> {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    for op in db.pending_ops(account)? {
+        if op.next_attempt > now {
+            continue;
+        }
+        let identify = op
+            .payload
+            .messages()
+            .first()
+            .map(|message| MessageId(message.message_id));
+        match apply_queued_op(db, session, account, &op).await {
+            Ok(folders) => {
+                db.complete_op(op.id)?;
+                for folder in folders {
+                    events
+                        .send(Event::MessagesChanged { account, folder })
+                        .ok();
+                }
+            }
+            Err(error) => {
+                let expired = now - op.created_at >= OP_FAIL_WINDOW.as_secs() as i64;
+                if is_hard_error(&error) || expired {
+                    tracing::warn!(op = op.id, %error, "queued operation failed; rolling back");
+                    db.rollback_op(op.id)?;
+                    if let Some(message) = identify {
+                        events
+                            .send(Event::OpFailed {
+                                account,
+                                message,
+                                error: error.to_string(),
+                            })
+                            .ok();
+                    }
+                } else {
+                    let next = now + op_backoff(op.attempts);
+                    tracing::debug!(op = op.id, %error, "queued operation will retry");
+                    db.fail_op(op.id, next, &error.to_string())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Perform one queued operation on the server. Returns the folders whose lists
+/// changed (for `MessagesChanged`).
+async fn apply_queued_op(
+    db: &Db,
+    session: &mut ImapSession,
+    account: AccountId,
+    op: &PendingOp,
+) -> Result<Vec<FolderId>> {
+    let mut folders = Vec::new();
+    match &op.payload {
+        OpPayload::Move { target, messages } => match target {
+            Some(id) => {
+                let destination_id = FolderId(*id);
+                let destination = db
+                    .folders(account)?
+                    .into_iter()
+                    .find(|folder| folder.id == destination_id)
+                    .ok_or(Error::FolderNotFound(*id))?;
+                for message in messages {
+                    folders.push(FolderId(message.folder_id));
+                    session
+                        .move_message(&message.path, message.uid, &destination.path)
+                        .await?;
+                }
+                // Re-fetch the destination so the moved messages pick up their
+                // new UIDs (our optimistic rows still hold the source UID).
+                let last_uid = db
+                    .folder(destination_id)?
+                    .map(|folder| folder.last_uid)
+                    .unwrap_or(0);
+                if let Err(error) =
+                    sync_folder(db, session, account, destination_id, &destination.path, last_uid)
+                        .await
+                {
+                    tracing::warn!(
+                        account = account.0,
+                        folder = %destination.path,
+                        %error,
+                        "could not resync destination after move"
+                    );
+                }
+                folders.push(destination_id);
+            }
+            None => {
+                for message in messages {
+                    folders.push(FolderId(message.folder_id));
+                    let mut flags = Flags::from_i64(message.flags);
+                    flags.seen = true;
+                    session.set_flags(&message.path, message.uid, flags).await?;
+                }
+            }
+        },
+        OpPayload::Flags { bit, value, messages } => {
+            for message in messages {
+                folders.push(FolderId(message.folder_id));
+                let mut flags = Flags::from_i64(message.flags);
+                if *bit == Flags::SEEN {
+                    flags.seen = *value;
+                } else if *bit == Flags::FLAGGED {
+                    flags.flagged = *value;
+                }
+                session.set_flags(&message.path, message.uid, flags).await?;
+            }
+        }
+    }
+    folders.sort_by_key(|folder| folder.0);
+    folders.dedup_by_key(|folder| folder.0);
+    Ok(folders)
+}
+
 /// Fetch and cache the bodies of several messages, batched per folder so a
 /// whole conversation costs one round trip per folder instead of one per
 /// message.
@@ -961,6 +1180,7 @@ async fn apply_fetch_attachment(
     message: MessageId,
     part: u32,
     destination: PathBuf,
+    open: bool,
     events: &mpsc::UnboundedSender<Event>,
 ) -> Result<()> {
     let report = |error: Option<String>| {
@@ -969,6 +1189,7 @@ async fn apply_fetch_attachment(
                 message,
                 part,
                 path: destination.clone(),
+                open,
                 error,
             })
             .ok();

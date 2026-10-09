@@ -117,8 +117,20 @@ fn open_db() -> Db {
         }
     }
     // Heal conversations for caches written before References threading existed.
-    if let Err(error) = db.rethread_all() {
-        tracing::warn!(%error, "failed to rebuild conversations");
+    // It only has to run once: the sync engine recomputes threading per account
+    // as it syncs, so later launches skip this pre-window work.
+    const THREADING_HEALED: &str = "threading.rebuilt_v1";
+    if db
+        .get_setting(THREADING_HEALED)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        if let Err(error) = db.rethread_all() {
+            tracing::warn!(%error, "failed to rebuild conversations");
+        } else if let Err(error) = db.set_setting(THREADING_HEALED, "1") {
+            tracing::warn!(%error, "could not record threading heal");
+        }
     }
     db
 }

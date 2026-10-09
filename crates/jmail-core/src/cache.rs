@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::account::{Account, AccountId, AuthKind, Provider, Security};
@@ -20,7 +21,7 @@ use crate::folder::{Folder, FolderId, SpecialUse};
 use crate::message::{Address, Attachment, Flags, Message, MessageBody, MessageId, NewMessage};
 
 /// Bump when the schema changes and add a matching migration step.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// A conversation as shown in the unified inbox: the latest message plus
 /// aggregate counts.
@@ -41,6 +42,60 @@ pub enum ThreadFilter {
     Folder(FolderId),
     /// Every cached message, grouped by conversation.
     All,
+}
+
+/// A message's server location captured *before* an optimistic change, so a
+/// queued operation can be applied on the server and, if it ultimately fails,
+/// rolled back locally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedMessage {
+    pub message_id: i64,
+    pub folder_id: i64,
+    pub path: String,
+    pub uid: u32,
+    pub flags: i64,
+}
+
+/// The work behind a queued server operation. Applied to the cache immediately
+/// (optimistically) when enqueued, then committed or rolled back by the engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum OpPayload {
+    /// Move messages to `target`, or mark them seen when `target` is `None`
+    /// (e.g. archiving on a server with no Archive mailbox).
+    Move {
+        target: Option<i64>,
+        messages: Vec<QueuedMessage>,
+    },
+    /// Set/clear a flag bit (`Flags::SEEN` or `Flags::FLAGGED`).
+    Flags {
+        bit: i64,
+        value: bool,
+        messages: Vec<QueuedMessage>,
+    },
+}
+
+impl OpPayload {
+    /// The messages this operation affects (and must restore on rollback).
+    pub fn messages(&self) -> &[QueuedMessage] {
+        match self {
+            OpPayload::Move { messages, .. } | OpPayload::Flags { messages, .. } => messages,
+        }
+    }
+}
+
+/// A row of the local outbox: a server operation applied optimistically to the
+/// cache and queued until the sync engine confirms (or rolls) it back.
+#[derive(Debug, Clone)]
+pub struct PendingOp {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub payload: OpPayload,
+    pub created_at: i64,
+    pub attempts: i64,
+    /// Unix time before which the engine should not retry this op.
+    pub next_attempt: i64,
+    pub last_error: Option<String>,
 }
 
 /// Handle to the on-disk SQLite cache. Cheap to clone; all clones share one
@@ -116,6 +171,9 @@ impl Db {
         }
         if version < 8 {
             conn.execute_batch(SCHEMA_V8).map_err(storage)?;
+        }
+        if version < 9 {
+            conn.execute_batch(SCHEMA_V9).map_err(storage)?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(storage)?;
@@ -391,6 +449,22 @@ impl Db {
         let reply_to_json =
             serde_json::to_string(&message.reply_to).unwrap_or_else(|_| "[]".into());
         let refs = message.references.join(" ");
+        // A message can move between folders (which changes its UID) while our
+        // optimistic cache row still holds the old UID. Drop any stale row for
+        // the same message-id in this folder so the re-fetch doesn't duplicate.
+        if !message.message_id.is_empty() {
+            conn.execute(
+                "DELETE FROM messages
+                  WHERE account_id = ?1 AND folder_id = ?2 AND message_id = ?3 AND uid != ?4",
+                params![
+                    message.account_id.0,
+                    message.folder_id.0,
+                    message.message_id,
+                    message.uid as i64
+                ],
+            )
+            .map_err(storage)?;
+        }
         conn.execute(
             "INSERT INTO messages
                 (account_id, folder_id, uid, message_id, thread_id, subject,
@@ -904,6 +978,135 @@ impl Db {
         Ok(())
     }
 
+    // ---- Outbox ------------------------------------------------------------
+
+    /// Apply `payload` to the cache immediately and record it in the outbox.
+    /// The sync engine later applies it on the server and either completes or
+    /// rolls it back.
+    pub fn enqueue_op(&self, account: AccountId, payload: &OpPayload) -> Result<i64> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let json = serde_json::to_string(payload).map_err(|e| Error::Storage(e.to_string()))?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(storage)?;
+        tx.execute(
+            "INSERT INTO pending_ops (account_id, payload, created_at, attempts, next_attempt)
+             VALUES (?1, ?2, ?3, 0, ?3)",
+            params![account.0, json, now],
+        )
+        .map_err(storage)?;
+        let op_id = tx.last_insert_rowid();
+        apply_optimistic(&tx, payload).map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(op_id)
+    }
+
+    /// Queued operations for an account, oldest first.
+    pub fn pending_ops(&self, account: AccountId) -> Result<Vec<PendingOp>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, payload, created_at, attempts, next_attempt, last_error
+                 FROM pending_ops WHERE account_id = ?1 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![account.0], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        let mut ops = Vec::with_capacity(rows.len());
+        for (id, json, created_at, attempts, next_attempt, last_error) in rows {
+            match serde_json::from_str::<OpPayload>(&json) {
+                Ok(payload) => ops.push(PendingOp {
+                    id,
+                    account_id: account,
+                    payload,
+                    created_at,
+                    attempts,
+                    next_attempt,
+                    last_error,
+                }),
+                Err(error) => {
+                    tracing::warn!(%error, op = id, "dropping malformed queued operation")
+                }
+            }
+        }
+        Ok(ops)
+    }
+
+    /// Whether `account` has any queued operation (used to yield prefetch).
+    pub fn has_pending_ops(&self, account: AccountId) -> Result<bool> {
+        let conn = self.lock()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_ops WHERE account_id = ?1",
+                params![account.0],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        Ok(count > 0)
+    }
+
+    /// Remove a completed operation.
+    pub fn complete_op(&self, op_id: i64) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM pending_ops WHERE id = ?1", params![op_id])
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Record a transient failure and schedule the next attempt.
+    pub fn fail_op(&self, op_id: i64, next_attempt: i64, error: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE pending_ops
+                SET attempts = attempts + 1, next_attempt = ?2, last_error = ?3
+              WHERE id = ?1",
+            params![op_id, next_attempt, error],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Undo an operation's cache changes and drop it.
+    pub fn rollback_op(&self, op_id: i64) -> Result<()> {
+        let mut conn = self.lock()?;
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM pending_ops WHERE id = ?1",
+                params![op_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let Some(json) = json else {
+            return Ok(());
+        };
+        let payload: OpPayload =
+            serde_json::from_str(&json).map_err(|e| Error::Storage(e.to_string()))?;
+        let tx = conn.transaction().map_err(storage)?;
+        for message in payload.messages() {
+            tx.execute(
+                "UPDATE messages SET folder_id = ?1, flags = ?2 WHERE id = ?3",
+                params![message.folder_id, message.flags, message.message_id],
+            )
+            .map_err(storage)?;
+        }
+        tx.execute("DELETE FROM pending_ops WHERE id = ?1", params![op_id])
+            .map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(())
+    }
+
     // ---- Settings ----------------------------------------------------------
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
@@ -1408,6 +1611,41 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
+/// Apply an operation's effect to the cache without touching the server.
+fn apply_optimistic(conn: &Connection, payload: &OpPayload) -> rusqlite::Result<()> {
+    match payload {
+        OpPayload::Move { target, messages } => {
+            for message in messages {
+                match target {
+                    Some(folder) => {
+                        conn.execute(
+                            "UPDATE messages SET folder_id = ?1 WHERE id = ?2",
+                            params![folder, message.message_id],
+                        )?;
+                    }
+                    None => {
+                        conn.execute(
+                            "UPDATE messages SET flags = flags | ?1 WHERE id = ?2",
+                            params![Flags::SEEN, message.message_id],
+                        )?;
+                    }
+                }
+            }
+        }
+        OpPayload::Flags { bit, value, messages } => {
+            let sql = if *value {
+                format!("UPDATE messages SET flags = flags | {bit} WHERE id = ?1")
+            } else {
+                format!("UPDATE messages SET flags = flags & ~{bit} WHERE id = ?1")
+            };
+            for message in messages {
+                conn.execute(&sql, params![message.message_id])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1547,6 +1785,22 @@ const SCHEMA_V8: &str = r#"
 ALTER TABLE messages ADD COLUMN body_loaded INTEGER NOT NULL DEFAULT 0;
 UPDATE messages SET body_loaded = 1
     WHERE body_text IS NOT NULL OR body_html IS NOT NULL;
+"#;
+
+/// The local outbox: server operations applied optimistically to the cache
+/// and queued until the sync engine confirms or rolls them back.
+const SCHEMA_V9: &str = r#"
+CREATE TABLE IF NOT EXISTS pending_ops (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    payload      TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    next_attempt INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_ops_account
+    ON pending_ops(account_id, next_attempt);
 "#;
 
 #[cfg(test)]
@@ -1995,5 +2249,107 @@ mod tests {
             .unwrap()
             .iter()
             .all(|thread| thread.message.account_id != generic.id));
+    }
+
+    fn snapshot(db: &Db, account: AccountId, thread_id: &str) -> Vec<QueuedMessage> {
+        db.thread_locations(account, thread_id)
+            .unwrap()
+            .into_iter()
+            .map(|(id, folder, path, uid, flags)| QueuedMessage {
+                message_id: id.0,
+                folder_id: folder.0,
+                path,
+                uid,
+                flags: flags.to_i64(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outbox_move_applies_optimistically_then_rolls_back() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let thread = db
+            .threads(ThreadFilter::Unified, 10)
+            .unwrap()
+            .into_iter()
+            .find(|thread| {
+                db.folders(thread.message.account_id)
+                    .map(|folders| folders.len() > 1)
+                    .unwrap_or(false)
+            })
+            .expect("a thread with an account that has multiple folders");
+        let account = thread.message.account_id;
+        let source = thread.message.folder_id;
+        let destination = db
+            .folders(account)
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.id != source)
+            .unwrap();
+
+        let messages = snapshot(&db, account, &thread.message.thread_id);
+        assert!(!messages.is_empty());
+        let op = db
+            .enqueue_op(
+                account,
+                &OpPayload::Move {
+                    target: Some(destination.id.0),
+                    messages: messages.clone(),
+                },
+            )
+            .unwrap();
+
+        // Optimistic: the message is already gone from the source and present
+        // in the destination, before any server round-trip.
+        assert!(db.has_pending_ops(account).unwrap());
+        assert!(!db
+            .messages_in_folder(source, 100)
+            .unwrap()
+            .iter()
+            .any(|message| message.id.0 == messages[0].message_id));
+        assert!(db
+            .messages_in_folder(destination.id, 100)
+            .unwrap()
+            .iter()
+            .any(|message| message.id.0 == messages[0].message_id));
+
+        // Rollback restores it.
+        db.rollback_op(op).unwrap();
+        assert!(!db.has_pending_ops(account).unwrap());
+        assert!(db
+            .messages_in_folder(source, 100)
+            .unwrap()
+            .iter()
+            .any(|message| message.id.0 == messages[0].message_id));
+    }
+
+    #[test]
+    fn outbox_flag_is_optimistic_and_rolls_back() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let thread = db.threads(ThreadFilter::Unified, 10).unwrap().remove(0);
+        let account = thread.message.account_id;
+        let messages = snapshot(&db, account, &thread.message.thread_id);
+        let original = messages[0].flags;
+        let already_flagged = original & Flags::FLAGGED != 0;
+
+        let op = db
+            .enqueue_op(
+                account,
+                &OpPayload::Flags {
+                    bit: Flags::FLAGGED,
+                    value: !already_flagged,
+                    messages: messages.clone(),
+                },
+            )
+            .unwrap();
+        let message = db.get_message(MessageId(messages[0].message_id)).unwrap().unwrap();
+        assert_eq!(message.flags.flagged, !already_flagged);
+
+        db.rollback_op(op).unwrap();
+        let message = db.get_message(MessageId(messages[0].message_id)).unwrap().unwrap();
+        assert_eq!(message.flags.flagged, already_flagged);
+        assert!(!db.has_pending_ops(account).unwrap());
     }
 }

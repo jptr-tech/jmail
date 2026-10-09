@@ -21,7 +21,7 @@ pub mod threading;
 pub mod verify;
 
 pub use account::{Account, AccountId, AuthKind, Provider, Security};
-pub use cache::{Db, ThreadFilter, ThreadSummary};
+pub use cache::{Db, OpPayload, PendingOp, QueuedMessage, ThreadFilter, ThreadSummary};
 pub use credentials::{Credential, Purpose};
 pub use error::{Error, Result};
 pub use events::Event;

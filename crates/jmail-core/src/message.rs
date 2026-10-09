@@ -43,10 +43,10 @@ pub struct Flags {
 }
 
 impl Flags {
-    pub(crate) const SEEN: i64 = 1 << 0;
-    pub(crate) const ANSWERED: i64 = 1 << 1;
-    pub(crate) const FLAGGED: i64 = 1 << 2;
-    pub(crate) const DRAFT: i64 = 1 << 3;
+    pub const SEEN: i64 = 1 << 0;
+    pub const ANSWERED: i64 = 1 << 1;
+    pub const FLAGGED: i64 = 1 << 2;
+    pub const DRAFT: i64 = 1 << 3;
 
     pub fn to_i64(self) -> i64 {
         let mut bits = 0;
