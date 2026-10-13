@@ -1120,7 +1120,7 @@ fn store_fetched_body(
     events: &mpsc::UnboundedSender<Event>,
 ) -> Result<()> {
     let parsed = mail_parser::MessageParser::default().parse(raw);
-    let text = parsed
+    let raw_text = parsed
         .as_ref()
         .and_then(|mail| mail.body_text(0))
         .map(|text| text.to_string());
@@ -1128,6 +1128,7 @@ fn store_fetched_body(
         .as_ref()
         .and_then(|mail| mail.body_html(0))
         .map(|html| html.to_string());
+    let (text, html) = prepare_body(raw_text, html);
     let snippet = snippet_of(text.as_deref().unwrap_or(""));
     db.set_body(message, text.as_deref(), html.as_deref(), &snippet)?;
 
@@ -1480,6 +1481,211 @@ fn snippet_of(text: &str) -> String {
     snippet
 }
 
+/// Normalise the parsed `text/plain` and `text/html` parts.
+///
+/// Some senders put their HTML in the text part: flatten that to readable text
+/// for the preview and search, and when there is no real HTML part, promote it
+/// so the reading pane renders it instead of showing the tags literally.
+fn prepare_body(
+    raw_text: Option<String>,
+    mut html: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let text = raw_text.map(|text| {
+        if looks_like_html(&text) {
+            if html.is_none() {
+                html = Some(text.clone());
+            }
+            html_to_text(&text)
+        } else {
+            text
+        }
+    });
+    (text, html)
+}
+
+/// Whether a `text/plain` body is really HTML. Some mailers ship their HTML in
+/// the text part; this is deliberately conservative so ordinary plain text that
+/// merely contains `<` is left alone.
+fn looks_like_html(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const MARKERS: [&str; 10] = [
+        "<html", "<body", "<head", "<table", "<div", "<style", "<!doctype", "</p>", "<br", "<p>",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Flatten an HTML fragment into readable plain text: comments and the contents
+/// of `<script>`/`<style>` are dropped, tags become whitespace, and common HTML
+/// entities are decoded.
+fn html_to_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0;
+    while cursor < html.len() {
+        let Some(rel) = lower[cursor..].find('<') else {
+            out.push_str(&html[cursor..]);
+            break;
+        };
+        let start = cursor + rel;
+        out.push_str(&html[cursor..start]);
+        // Comments: skip to the end marker.
+        if lower[start..].starts_with("<!--") {
+            cursor = lower[start..]
+                .find("-->")
+                .map(|rel| start + rel + 3)
+                .unwrap_or(html.len());
+            continue;
+        }
+        let Some(gt) = lower[start..].find('>').map(|rel| start + rel + 1) else {
+            break;
+        };
+        // `<script>`/`<style>`: drop the element and everything inside it.
+        if let Some(name) = raw_text_tag(&lower[start..gt]) {
+            let close = format!("</{name}");
+            cursor = lower[gt..]
+                .find(&close)
+                .and_then(|rel| lower[gt + rel..].find('>').map(|gt2| gt + rel + gt2 + 1))
+                .unwrap_or(gt);
+            out.push(' ');
+            continue;
+        }
+        // Any other tag is a boundary; its name carries no readable text.
+        out.push(' ');
+        cursor = gt;
+    }
+    decode_entities(&out)
+}
+
+/// If `tag` (the lowercased slice from `<` through `>`) opens a raw-text element
+/// whose contents must be discarded, return its name.
+fn raw_text_tag(tag: &str) -> Option<&'static str> {
+    let name = tag
+        .trim_start_matches('<')
+        .trim_start_matches('/')
+        .split(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
+        .next()
+        .unwrap_or("");
+    match name {
+        "script" => Some("script"),
+        "style" => Some("style"),
+        _ => None,
+    }
+}
+
+/// Decode the HTML entities that commonly appear in previewed text.
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find('&') {
+        out.push_str(&rest[..index]);
+        rest = &rest[index..];
+        if let Some(end) = rest.find(';').filter(|end| *end <= 12) {
+            if let Some(decoded) = decode_entity(&rest[1..end]) {
+                out.push_str(&decoded);
+                rest = &rest[end + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = &rest[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_entity(entity: &str) -> Option<String> {
+    let named = match entity {
+        "nbsp" => " ",
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "apos" => "'",
+        "mdash" => "\u{2014}",
+        "ndash" => "\u{2013}",
+        "hellip" => "\u{2026}",
+        "lsquo" => "\u{2018}",
+        "rsquo" => "\u{2019}",
+        "ldquo" => "\u{201c}",
+        "rdquo" => "\u{201d}",
+        "copy" => "\u{a9}",
+        _ => return decode_numeric_entity(entity),
+    };
+    Some(named.to_string())
+}
+
+fn decode_numeric_entity(entity: &str) -> Option<String> {
+    let digits = entity.strip_prefix('#')?;
+    let code = if let Some(hex) = digits.strip_prefix('x').or_else(|| digits.strip_prefix('X')) {
+        u32::from_str_radix(hex, 16).ok()?
+    } else {
+        digits.parse::<u32>().ok()?
+    };
+    char::from_u32(code).map(String::from)
+}
+
 fn protocol(error: impl std::fmt::Display) -> Error {
     Error::Protocol(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_html_in_text_parts() {
+        assert!(looks_like_html("<p></p><p>hello</p>"));
+        assert!(looks_like_html("<table><tr><td>x</td></tr></table>"));
+        assert!(!looks_like_html("Just a plain message.\n\nRegards,\nLuke"));
+        assert!(!looks_like_html("Cost is 3 < 5 dollars"));
+    }
+
+    #[test]
+    fn flattens_html_bodies_to_text() {
+        let html = "<p></p>\n\
+            <p> <!--[if mso]><xml><o:PixelsPerInch>96</o:PixelsPerInch></xml><![endif]--></p>\n\
+            <style>\n* { box-sizing: border-box; }\nbody { margin: 0; }\n</style>\n\
+            <p>Hello &amp; welcome, Luke&nbsp;!</p><br><div>Second line</div><!-- a comment -->";
+        let text = html_to_text(html);
+        assert!(!text.contains('<'), "tags should be gone: {text:?}");
+        assert!(!text.contains("box-sizing"), "style contents: {text:?}");
+        assert!(!text.contains("PixelsPerInch"), "comments: {text:?}");
+        assert!(text.contains("Hello & welcome, Luke !"), "{text:?}");
+        assert!(text.contains("Second line"), "{text:?}");
+
+        let snippet = snippet_of(&text);
+        assert!(!snippet.contains('<'));
+        assert!(snippet.contains("Hello & welcome, Luke !"));
+    }
+
+    #[test]
+    fn decodes_entities_in_flattened_text() {
+        assert_eq!(html_to_text("a&amp;b"), "a&b");
+        assert_eq!(html_to_text("&#39;quoted&#39;"), "'quoted'");
+        assert_eq!(html_to_text("&#x2014;"), "\u{2014}");
+        // An '&' that is not an entity, or an unknown one, is left alone.
+        assert_eq!(html_to_text("A & B"), "A & B");
+        assert_eq!(html_to_text("caf&eacute;"), "caf&eacute;");
+    }
+
+    #[test]
+    fn promotes_html_in_text_when_there_is_no_html_part() {
+        // No HTML part: the mislabelled text is promoted and flattened.
+        let (text, html) = prepare_body(Some("<p>Hi</p>".to_string()), None);
+        assert_eq!(html.as_deref(), Some("<p>Hi</p>"));
+        assert_eq!(text.as_deref().map(str::trim), Some("Hi"));
+
+        // A real HTML part wins; the text part is still cleaned.
+        let (text, html) = prepare_body(
+            Some("<p>Hi</p>".to_string()),
+            Some("<b>Body</b>".to_string()),
+        );
+        assert_eq!(html.as_deref(), Some("<b>Body</b>"));
+        assert_eq!(text.as_deref().map(str::trim), Some("Hi"));
+
+        // Plain text is left byte-for-byte.
+        let (text, html) = prepare_body(Some("plain  text".to_string()), None);
+        assert_eq!(text.as_deref(), Some("plain  text"));
+        assert!(html.is_none());
+    }
 }

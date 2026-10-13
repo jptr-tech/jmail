@@ -191,10 +191,30 @@ impl AccountsGroup {
         self.rows.borrow_mut().push(row.clone());
     }
 
-    /// (Re)build the account rows: an "Add Account…" row plus one row per account.
+    /// (Re)build the account rows: GNOME Online Accounts first, then the
+    /// "Add Account…" action, then accounts added by hand.
     fn refresh(&self) {
         self.clear();
 
+        let Some(context) = crate::context::get() else {
+            self.push(&self.add_row());
+            return;
+        };
+        let accounts = context.db.accounts().unwrap_or_default();
+        let (goa, manual): (Vec<Account>, Vec<Account>) = accounts
+            .into_iter()
+            .partition(|account| account.goa_object_path.is_some());
+        for account in &goa {
+            self.push(&account_row(self, context, account));
+        }
+        self.push(&self.add_row());
+        for account in &manual {
+            self.push(&account_row(self, context, account));
+        }
+    }
+
+    /// The "Add Account…" row for manually configured IMAP/SMTP.
+    fn add_row(&self) -> gtk::Widget {
         let add = adw::ActionRow::builder()
             .title("Add Account…")
             .subtitle("IMAP/SMTP with a password")
@@ -216,93 +236,93 @@ impl AccountsGroup {
             });
         }
         add.add_suffix(&add_button);
-        self.push(add.upcast_ref());
-
-        let Some(context) = crate::context::get() else {
-            return;
-        };
-        let accounts = context.db.accounts().unwrap_or_default();
-        for account in accounts {
-            let row = adw::ActionRow::builder()
-                .title(&account.email)
-                .subtitle(account_subtitle(&account))
-                .build();
-
-            if account.goa_object_path.is_some() {
-                // Accounts provided by GNOME Online Accounts are reconciled on
-                // every launch, so they can be disabled but not removed here.
-                let toggle = gtk::Switch::builder()
-                    .valign(gtk::Align::Center)
-                    .active(account.enabled)
-                    .tooltip_text("Sync this account")
-                    .build();
-                {
-                    let account_id = account.id;
-                    let engine = context.engine.clone();
-                    let db = context.db.clone();
-                    let runtime = context.runtime.clone();
-                    toggle.connect_state_set(move |_, active| {
-                        if let Err(error) = db.set_account_enabled(account_id, active) {
-                            tracing::error!(%error, "could not update account");
-                        }
-                        if active {
-                            let engine = engine.clone();
-                            runtime.spawn(async move {
-                                let _ = engine.start_account(account_id).await;
-                            });
-                        } else {
-                            engine.stop_account(account_id);
-                        }
-                        engine.notify_accounts_changed();
-                        gtk::glib::Propagation::Proceed
-                    });
-                }
-                row.add_suffix(&toggle);
-            } else {
-                let actions = gtk::Box::new(Orientation::Horizontal, 6);
-                actions.set_valign(gtk::Align::Center);
-
-                let edit = gtk::Button::with_label("Edit");
-                {
-                    let accounts = self.clone();
-                    let account = account.clone();
-                    edit.connect_clicked(move |button| {
-                        let parent = button
-                            .root()
-                            .and_then(|root| root.downcast::<gtk::Window>().ok());
-                        let accounts = accounts.clone();
-                        present_edit_account(parent.as_ref(), account.clone(), move || {
-                            accounts.refresh()
-                        });
-                    });
-                }
-                actions.append(&edit);
-
-                let remove = gtk::Button::with_label("Remove");
-                remove.add_css_class("destructive-action");
-                {
-                    let accounts = self.clone();
-                    let account_id = account.id;
-                    let engine = context.engine.clone();
-                    let db = context.db.clone();
-                    remove.connect_clicked(move |_| {
-                        engine.stop_account(account_id);
-                        if let Err(error) = jmail_core::secrets::delete_password(&db, account_id) {
-                            tracing::warn!(%error, "could not delete stored password");
-                        }
-                        if let Err(error) = db.remove_account(account_id) {
-                            tracing::error!(%error, "could not remove account");
-                        }
-                        engine.notify_accounts_changed();
-                        accounts.refresh();
-                    });
-                }
-                actions.append(&remove);
-                row.add_suffix(&actions);
-            }
-            self.push(row.upcast_ref());
-        }
+        add.upcast()
     }
+}
+
+/// A preferences row for one account. GNOME Online Accounts are reconciled on
+/// every launch, so they get an enable switch; manual ones get Edit/Remove.
+fn account_row(
+    group: &AccountsGroup,
+    context: &crate::context::AppContext,
+    account: &Account,
+) -> gtk::Widget {
+    let row = adw::ActionRow::builder()
+        .title(&account.email)
+        .subtitle(account_subtitle(account))
+        .build();
+
+    if account.goa_object_path.is_some() {
+        let toggle = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .active(account.enabled)
+            .tooltip_text("Sync this account")
+            .build();
+        {
+            let account_id = account.id;
+            let engine = context.engine.clone();
+            let db = context.db.clone();
+            let runtime = context.runtime.clone();
+            toggle.connect_state_set(move |_, active| {
+                if let Err(error) = db.set_account_enabled(account_id, active) {
+                    tracing::error!(%error, "could not update account");
+                }
+                if active {
+                    let engine = engine.clone();
+                    runtime.spawn(async move {
+                        let _ = engine.start_account(account_id).await;
+                    });
+                } else {
+                    engine.stop_account(account_id);
+                }
+                engine.notify_accounts_changed();
+                gtk::glib::Propagation::Proceed
+            });
+        }
+        row.add_suffix(&toggle);
+    } else {
+        let actions = gtk::Box::new(Orientation::Horizontal, 6);
+        actions.set_valign(gtk::Align::Center);
+
+        let edit = gtk::Button::with_label("Edit");
+        {
+            let accounts = group.clone();
+            let account = account.clone();
+            edit.connect_clicked(move |button| {
+                let parent = button
+                    .root()
+                    .and_then(|root| root.downcast::<gtk::Window>().ok());
+                let accounts = accounts.clone();
+                present_edit_account(parent.as_ref(), account.clone(), move || {
+                    accounts.refresh()
+                });
+            });
+        }
+        actions.append(&edit);
+
+        let remove = gtk::Button::with_label("Remove");
+        remove.add_css_class("destructive-action");
+        {
+            let accounts = group.clone();
+            let account_id = account.id;
+            let engine = context.engine.clone();
+            let db = context.db.clone();
+            remove.connect_clicked(move |_| {
+                engine.stop_account(account_id);
+                if let Err(error) = jmail_core::secrets::delete_password(&db, account_id) {
+                    tracing::warn!(%error, "could not delete stored password");
+                }
+                if let Err(error) = db.remove_account(account_id) {
+                    tracing::error!(%error, "could not remove account");
+                }
+                engine.notify_accounts_changed();
+                accounts.refresh();
+            });
+        }
+        actions.append(&remove);
+        row.add_suffix(&actions);
+    }
+    row.upcast()
 }
 
 /// A short human-readable description of an account's servers.
