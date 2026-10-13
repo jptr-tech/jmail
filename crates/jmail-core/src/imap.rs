@@ -765,7 +765,7 @@ fn server_message_from(fetch: Fetch) -> Option<ServerMessage> {
         subject: envelope
             .subject
             .as_ref()
-            .map(|s| String::from_utf8_lossy(s).to_string())
+            .map(|s| decode_header(s))
             .unwrap_or_default(),
         from: envelope
             .from
@@ -849,26 +849,113 @@ fn message_ids(value: &str) -> Vec<String> {
 }
 
 fn address_of(address: &imap_proto::Address<'_>) -> Address {
-    Address {
-        name: address
-            .name
+    let email = format!(
+        "{}@{}",
+        address
+            .mailbox
             .as_ref()
-            .map(|name| String::from_utf8_lossy(name).to_string())
+            .map(|mailbox| String::from_utf8_lossy(mailbox))
             .unwrap_or_default(),
-        email: format!(
-            "{}@{}",
-            address
-                .mailbox
-                .as_ref()
-                .map(|mailbox| String::from_utf8_lossy(mailbox))
-                .unwrap_or_default(),
-            address
-                .host
-                .as_ref()
-                .map(|host| String::from_utf8_lossy(host))
-                .unwrap_or_default()
-        ),
+        address
+            .host
+            .as_ref()
+            .map(|host| String::from_utf8_lossy(host))
+            .unwrap_or_default()
+    );
+    let name = address
+        .name
+        .as_ref()
+        .map(|name| decode_header(name))
+        .unwrap_or_default();
+    Address {
+        name: clean_display_name(&name, &email),
+        email,
     }
+}
+
+/// Decode an RFC 2047 encoded header value (for example
+/// `=?utf-8?Q?=E2=9C=A8Shop?= With Miles`) into plain UTF-8. Values without an
+/// encoded-word are returned byte-for-byte so their exact spacing survives.
+fn decode_header(value: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(value);
+    if !raw.contains("=?") {
+        return raw.into_owned();
+    }
+    // `parse_unstructured` only flushes its tokens at a line break, so terminate
+    // the value. It also joins adjacent encoded-words and drops the whitespace
+    // between them, as RFC 2047 requires.
+    let mut input = Vec::with_capacity(value.len() + 1);
+    input.extend_from_slice(value);
+    input.push(b'\n');
+    let parsed = mail_parser::parsers::MessageStream::new(&input).parse_unstructured();
+    if parsed.is_empty() {
+        raw.into_owned()
+    } else {
+        parsed.unwrap_text().into_owned()
+    }
+}
+
+/// Tidy a display name for presentation.
+///
+/// Address names come back from the IMAP envelope still wrapped in literal
+/// `\"…\"` (or `"…"`) quoting, which is stripped here. Display names rewritten by
+/// addy.io additionally bury the original sender's address in the name — either
+/// `Display Name 'local at domain'`, or a bare `local at domain` when the sender
+/// had no display name — which is unpacked so the header stays readable.
+fn clean_display_name(name: &str, email: &str) -> String {
+    let unquoted = unquote_display_name(name);
+    if !is_addy_alias(email) {
+        return unquoted;
+    }
+    // `Display Name 'local at domain'` → `Display Name`.
+    if let Some(without_trailing_quote) = unquoted.strip_suffix('\'') {
+        if let Some(open) = without_trailing_quote.rfind(" '") {
+            let inner = &without_trailing_quote[open + 2..];
+            if inner.contains(" at ") {
+                let head = without_trailing_quote[..open].trim();
+                if !head.is_empty() {
+                    return head.to_string();
+                }
+            }
+        }
+    }
+    // Bare `local at domain` → `local@domain`.
+    if !unquoted.contains('\'') {
+        if let Some((local, domain)) = unquoted.rsplit_once(" at ") {
+            if !local.is_empty() && !local.contains(' ') && domain.contains('.') {
+                return format!("{local}@{domain}");
+            }
+        }
+    }
+    unquoted
+}
+
+/// Strip one layer of quoting from a display name. The IMAP envelope often hands
+/// names back as `\"…\"` (a literal backslash-quote) rather than plain text.
+fn unquote_display_name(name: &str) -> String {
+    let trimmed = name.trim();
+    for (open, close) in [("\\\"", "\\\""), ("\"", "\"")] {
+        if let Some(inner) = trimmed
+            .strip_prefix(open)
+            .and_then(|rest| rest.strip_suffix(close))
+        {
+            return inner.replace("\\\"", "\"").trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Whether `email` is an addy.io alias address (including custom alias domains
+/// such as `covalent.anonaddy.me`).
+fn is_addy_alias(email: &str) -> bool {
+    let Some((_, domain)) = email.rsplit_once('@') else {
+        return false;
+    };
+    let domain = domain.to_ascii_lowercase();
+    domain == "addy.io"
+        || domain.ends_with(".addy.io")
+        || domain == "anonaddy.me"
+        || domain.ends_with(".anonaddy.me")
 }
 
 fn address_list(addresses: Option<&Vec<imap_proto::Address<'_>>>) -> Vec<Address> {
@@ -905,5 +992,72 @@ mod tests {
     fn credential_accepts_a_bare_password() {
         let credential: Credential = "hunter2".into();
         assert!(matches!(credential, Credential::Password(ref p) if p == "hunter2"));
+    }
+
+    #[test]
+    fn decodes_rfc2047_headers() {
+        assert_eq!(
+            decode_header(b"=?utf-8?Q?=E2=9C=A8Shop?= With Miles, Discover The Latest Tech!"),
+            "\u{2728}Shop With Miles, Discover The Latest Tech!"
+        );
+        // Adjacent encoded-words: the separating whitespace is dropped.
+        assert_eq!(
+            decode_header(b"=?UTF-8?Q?Jc_Mi=C3=B1arro?="),
+            "Jc Mi\u{f1}arro"
+        );
+        // Literal text between encoded-words is preserved.
+        assert_eq!(
+            decode_header(
+                b"Today's Headlines: =?utf-8?Q?=E2=80=98Nothing?= has =?utf-8?Q?changed=E2=80=99=3A?="
+            ),
+            "Today's Headlines: \u{2018}Nothing has changed\u{2019}:"
+        );
+        // Base64 and a non-UTF-8 charset.
+        assert_eq!(
+            decode_header(b"=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?="),
+            "If you can read this yo"
+        );
+        assert_eq!(
+            decode_header(b"=?iso-8859-1?Q?Patrik_F=E4ltstr=F6m?="),
+            "Patrik F\u{e4}ltstr\u{f6}m"
+        );
+    }
+
+    #[test]
+    fn leaves_plain_headers_untouched() {
+        assert_eq!(decode_header(b"Just a plain subject"), "Just a plain subject");
+        // Exact spacing survives when there is nothing to decode.
+        assert_eq!(decode_header(b"  spaced   out  "), "  spaced   out  ");
+        assert_eq!(decode_header(b""), "");
+    }
+
+    #[test]
+    fn cleans_display_names() {
+        // Literal backslash-quotes are stripped for every sender.
+        assert_eq!(
+            clean_display_name("\\\"Kellerman, Joshua\\\"", "joshua@brkl.com"),
+            "Kellerman, Joshua"
+        );
+        assert_eq!(
+            clean_display_name("Kevin Eisenfrats, Founder of Contraline", "k@contraline.com"),
+            "Kevin Eisenfrats, Founder of Contraline"
+        );
+        // addy.io buries the original address in the name.
+        assert_eq!(
+            clean_display_name(
+                "\\\"The Boston Globe 'newsletters at email.bostonglobe.com'\\\"",
+                "4j4q8e9g+x@covalent.anonaddy.me"
+            ),
+            "The Boston Globe"
+        );
+        assert_eq!(
+            clean_display_name("\\\"etickets at amtrak.com\\\"", "x@anonaddy.me"),
+            "etickets@amtrak.com"
+        );
+        // ` at ` is only unpacked for addy.io aliases.
+        assert_eq!(
+            clean_display_name("Meet at Joe's", "joe@example.com"),
+            "Meet at Joe's"
+        );
     }
 }
