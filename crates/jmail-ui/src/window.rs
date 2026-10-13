@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -61,6 +61,15 @@ pub struct Ui {
     /// Whether message bodies ignore the sender's colours and follow the app
     /// theme instead (reading setting).
     pub readable_colors: Rc<Cell<bool>>,
+    /// Accounts with a sync in flight, so the folder pane can show a spinner.
+    pub syncing: Rc<RefCell<HashSet<AccountId>>>,
+    /// Accounts whose folder list is expanded in the sidebar, kept across
+    /// rebuilds.
+    expanded_accounts: Rc<RefCell<HashSet<AccountId>>>,
+    /// Spinner shown beside each account's name while it syncs.
+    sync_spinners: Rc<RefCell<HashMap<AccountId, gtk::Spinner>>>,
+    /// Spinner on the "Joined Inbox" row, shown while any account syncs.
+    joined_spinner: Rc<RefCell<Option<gtk::Spinner>>>,
     /// Result handlers for open compose windows, keyed by correlation id.
     pub compose_replies: Rc<RefCell<HashMap<u64, Rc<dyn Fn(crate::compose::ComposeOutcome)>>>>,
     next_compose_id: Rc<Cell<u64>>,
@@ -202,6 +211,10 @@ impl Ui {
             folder_rows: Rc::new(RefCell::new(Vec::new())),
             remote_images,
             readable_colors,
+            syncing: Rc::new(RefCell::new(HashSet::new())),
+            expanded_accounts: Rc::new(RefCell::new(HashSet::new())),
+            sync_spinners: Rc::new(RefCell::new(HashMap::new())),
+            joined_spinner: Rc::new(RefCell::new(None)),
             compose_replies: Rc::new(RefCell::new(HashMap::new())),
             next_compose_id: Rc::new(Cell::new(0)),
             pending_draft: Rc::new(RefCell::new(None)),
@@ -326,11 +339,17 @@ impl Ui {
                 crate::actions::schedule_reload_preview(self);
                 self.maybe_open_pending_draft();
             }
-            Event::SyncStarted { .. } => {
+            Event::SyncStarted { account } => {
+                self.syncing.borrow_mut().insert(account);
+                self.refresh_sync_indicators();
                 self.status_label.set_text("Syncing…");
             }
-            Event::SyncFinished { .. } => {
-                self.status_label.set_text("Up to date");
+            Event::SyncFinished { account } => {
+                self.syncing.borrow_mut().remove(&account);
+                self.refresh_sync_indicators();
+                if self.syncing.borrow().is_empty() {
+                    self.status_label.set_text("Up to date");
+                }
             }
             Event::SendResult { id, error, .. } => {
                 self.deliver_compose(id, crate::compose::ComposeOutcome::Send { error });
@@ -482,6 +501,22 @@ impl Ui {
         self.folder_rows.borrow_mut().clear();
         populate_folders(&self.folder_content, &self.db, Some(self));
         apply_folder_highlight(self);
+    }
+
+    /// Show a spinner beside each account that is currently syncing (and on the
+    /// Joined Inbox row when any of them is), so a slow sync is visible.
+    pub fn refresh_sync_indicators(&self) {
+        let syncing = self.syncing.borrow();
+        for (account, spinner) in self.sync_spinners.borrow().iter() {
+            let active = syncing.contains(account);
+            spinner.set_spinning(active);
+            spinner.set_visible(active);
+        }
+        if let Some(spinner) = self.joined_spinner.borrow().as_ref() {
+            let active = !syncing.is_empty();
+            spinner.set_spinning(active);
+            spinner.set_visible(active);
+        }
     }
 
     pub fn present(&self) {
@@ -798,52 +833,68 @@ fn build_folder_pane(content: &gtk::Box) -> gtk::Widget {
 
 /// (Re)build the account and folder rows inside `content`, wiring clicks to
 /// the folder view when a `Ui` handle is available.
+///
+/// Everything lives in one navigation-sidebar `ListBox`: the Joined Inbox row,
+/// then one expanding account row per inbox with its folders beneath it.
 fn populate_folders(content: &gtk::Box, db: &Db, ui: Option<&Ui>) {
-    let joined = folder_list();
-    let joined_row = folder_row("mail-unread-symbolic", "Joined Inbox", None);
     if let Some(ui) = ui {
+        ui.sync_spinners.borrow_mut().clear();
+        *ui.joined_spinner.borrow_mut() = None;
+    }
+
+    let sidebar = folder_list();
+
+    let joined_row = folder_row("mail-unread-symbolic", "Joined Inbox", None);
+    let joined_spinner = gtk::Spinner::new();
+    joined_spinner.set_valign(Align::Center);
+    joined_spinner.set_visible(false);
+    joined_row.add_suffix(&joined_spinner);
+    if let Some(ui) = ui {
+        *ui.joined_spinner.borrow_mut() = Some(joined_spinner);
         ui.folder_rows
             .borrow_mut()
             .push((ThreadFilter::Unified, joined_row.clone()));
         let ui = ui.clone();
         joined_row.connect_activated(move |_| set_view(&ui, "Joined Inbox", ThreadFilter::Unified));
     }
-    joined.append(&joined_row);
-    content.append(&joined);
+    sidebar.append(&joined_row);
 
+    let mut empty: Option<gtk::Label> = None;
     match db.accounts() {
         Ok(accounts) if accounts.is_empty() => {
-            let empty = gtk::Label::new(Some("No accounts yet.\nAdd one in Settings."));
-            empty.set_xalign(0.0);
-            empty.set_margin_top(24);
-            empty.set_margin_start(12);
-            empty.set_margin_end(12);
-            empty.set_wrap(true);
-            empty.add_css_class("dim-label");
-            content.append(&empty);
+            let label = gtk::Label::new(Some("No accounts yet.\nAdd one in Settings."));
+            label.set_xalign(0.0);
+            label.set_margin_top(24);
+            label.set_margin_start(12);
+            label.set_margin_end(12);
+            label.set_wrap(true);
+            label.add_css_class("dim-label");
+            empty = Some(label);
         }
         Ok(accounts) => {
             for account in accounts.iter().filter(|account| account.enabled) {
-                let label = gtk::Label::builder()
-                    .label(&account.email)
-                    .xalign(0.0)
-                    .margin_top(12)
-                    .margin_bottom(4)
-                    .margin_start(12)
-                    .build();
-                label.add_css_class("dim-label");
-                label.add_css_class("caption");
-                label.add_css_class("heading");
-                content.append(&label);
+                // The account is a row in the same list as everything else, so it
+                // looks consistent; activating it reveals or hides its folders.
+                let header = folder_row("avatar-default-symbolic", &account.email, None);
+                header.set_title_lines(1);
+                let spinner = gtk::Spinner::new();
+                spinner.set_valign(Align::Center);
+                spinner.set_visible(false);
+                header.add_suffix(&spinner);
+                let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
+                arrow.set_valign(Align::Center);
+                header.add_suffix(&arrow);
+                if let Some(ui) = ui {
+                    ui.sync_spinners
+                        .borrow_mut()
+                        .insert(account.id, spinner);
+                }
+                sidebar.append(&header);
 
-                let list = folder_list();
+                let mut folder_widgets: Vec<adw::ActionRow> = Vec::new();
                 if let Ok(folders) = db.folders(account.id) {
                     for folder in &folders {
-                        let row = folder_row(
-                            folder_icon(folder.special_use),
-                            &folder.name,
-                            None,
-                        );
+                        let row = folder_row(folder_icon(folder.special_use), &folder.name, None);
                         if let Some(ui) = ui {
                             let id = folder.id;
                             ui.folder_rows
@@ -855,13 +906,59 @@ fn populate_folders(content: &gtk::Box, db: &Db, ui: Option<&Ui>) {
                                 set_view(&ui, &name, ThreadFilter::Folder(id))
                             });
                         }
-                        list.append(&row);
+                        sidebar.append(&row);
+                        folder_widgets.push(row);
                     }
                 }
-                content.append(&list);
+
+                let expanded = ui
+                    .map(|ui| ui.expanded_accounts.borrow().contains(&account.id))
+                    .unwrap_or(false);
+                for row in &folder_widgets {
+                    row.set_visible(expanded);
+                }
+                arrow.set_icon_name(if expanded {
+                    Some("pan-down-symbolic")
+                } else {
+                    Some("pan-end-symbolic")
+                });
+
+                let arrow = arrow.clone();
+                let expanded_accounts = ui.map(|ui| ui.expanded_accounts.clone());
+                let account_id = account.id;
+                header.connect_activated(move |_| {
+                    let now = !folder_widgets
+                        .first()
+                        .map(|row| row.is_visible())
+                        .unwrap_or(false);
+                    for row in &folder_widgets {
+                        row.set_visible(now);
+                    }
+                    arrow.set_icon_name(if now {
+                        Some("pan-down-symbolic")
+                    } else {
+                        Some("pan-end-symbolic")
+                    });
+                    if let Some(set) = &expanded_accounts {
+                        if now {
+                            set.borrow_mut().insert(account_id);
+                        } else {
+                            set.borrow_mut().remove(&account_id);
+                        }
+                    }
+                });
             }
         }
         Err(error) => tracing::error!(%error, "failed to load accounts"),
+    }
+
+    content.append(&sidebar);
+    if let Some(label) = empty {
+        content.append(&label);
+    }
+
+    if let Some(ui) = ui {
+        ui.refresh_sync_indicators();
     }
 }
 
