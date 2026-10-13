@@ -849,6 +849,47 @@ impl Db {
         Ok(())
     }
 
+    /// `(id, uid, flags)` for the newest `limit` messages in a folder. Used to
+    /// refresh read/unread/star state without loading full rows.
+    pub fn folder_flag_state(
+        &self,
+        folder: FolderId,
+        limit: u32,
+    ) -> Result<Vec<(MessageId, u32, Flags)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, uid, flags FROM messages
+                 WHERE folder_id = ?1
+                 ORDER BY date DESC, id DESC
+                 LIMIT ?2",
+            )
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![folder.0, limit], |row| {
+                Ok((
+                    MessageId(row.get(0)?),
+                    row.get::<_, u32>(1)?,
+                    Flags::from_i64(row.get(2)?),
+                ))
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        Ok(rows)
+    }
+
+    /// Update only a folder's unread count (after a flag refresh).
+    pub fn set_folder_unread(&self, folder: FolderId, unread: u32) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE folders SET unread = ?1 WHERE id = ?2",
+            params![unread as i64, folder.0],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
     pub fn delete_message(&self, id: MessageId) -> Result<()> {
         let conn = self.lock()?;
         conn.execute("DELETE FROM messages WHERE id = ?1", params![id.0])

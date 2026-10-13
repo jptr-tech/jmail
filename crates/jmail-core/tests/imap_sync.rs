@@ -470,6 +470,94 @@ async fn engine_moves_thread_to_named_folder() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_refreshes_flags_changed_on_server() {
+    // Incremental sync only fetches new UIDs, so a message marked unread in
+    // another client would keep a stale `\Seen` forever. Opening the folder
+    // asks the engine to re-read flags (see `SyncCommand::RefreshFlags`).
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let archive = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Archive)
+        .expect("mock has an Archive folder");
+    let message = db
+        .messages_in_folder(archive.id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.subject == "Old thread")
+        .expect("archived message cached");
+    assert!(message.flags.seen, "archived message starts read");
+
+    // Another client marks it unread on the server.
+    let mut other = ImapSession::connect(
+        settings(server.addr().port(), Security::None),
+        "hunter2",
+        &TlsTrust::system().unwrap(),
+    )
+    .await
+    .expect("second session");
+    other
+        .set_flags(&archive.path, message.uid, Flags::default())
+        .await
+        .expect("clear seen flag");
+    drop(other);
+
+    engine.send(account, SyncCommand::RefreshFlags { folder: archive.id });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(
+            event,
+            jmail_core::events::Event::MessagesChanged { folder, .. } if folder == archive.id
+        ) {
+            break;
+        }
+    }
+
+    let refreshed = db.get_message(message.id).unwrap().expect("still cached");
+    assert!(
+        !refreshed.flags.seen,
+        "server-side unread should reach the cache"
+    );
+    assert_eq!(db.folder(archive.id).unwrap().unwrap().unread, 1);
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_flushes_optimistic_move_from_outbox() {
     let server = start_server(false).await;
     let db = Db::open_in_memory().unwrap();

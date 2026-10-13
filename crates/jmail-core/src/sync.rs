@@ -32,6 +32,15 @@ const PREFETCH_START_DELAY: Duration = Duration::from_secs(5);
 /// How long a queued operation keeps retrying transient failures before the
 /// engine rolls it back locally.
 const OP_FAIL_WINDOW: Duration = Duration::from_secs(60);
+/// How many of a folder's newest messages get their flags re-read from the
+/// server on each refresh (kept small so a huge mailbox is cheap to check).
+const FLAG_REFRESH_WINDOW: u32 = 300;
+/// UIDs fetched per `FETCH` when refreshing flags (keeps commands short).
+const FLAG_REFRESH_CHUNK: usize = 200;
+/// How often every folder's flags are re-read. The Inbox is refreshed far more
+/// often (on each poll/IDLE wake); this slower pass catches archives and other
+/// folders the user is not currently looking at.
+const FLAG_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Where a conversation should be moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +73,9 @@ pub enum SyncCommand {
     MoveThread { message: MessageId, to: MoveTarget },
     /// Apply any queued (optimistic) operations for this account now.
     FlushOutbox,
+    /// Re-read read/unread/star flags for a folder's newest messages from the
+    /// server (sent when the user opens the folder).
+    RefreshFlags { folder: FolderId },
     /// Fetch and cache message bodies (batched per folder).
     FetchBodies { messages: Vec<MessageId> },
     /// Fetch a message and save one of its MIME attachments to a local path.
@@ -338,6 +350,8 @@ async fn run_session(
         );
     }
     let mut next_prefetch = tokio::time::Instant::now() + PREFETCH_START_DELAY;
+    // Slower full-folder flag refresh; the Inbox is refreshed on every poll.
+    let mut next_flag_refresh = tokio::time::Instant::now() + FLAG_REFRESH_INTERVAL;
     loop {
         let Some(current) = session.take() else { return Ok(()) };
         let unsolicited = current.unsolicited_receiver();
@@ -436,6 +450,7 @@ async fn run_session(
         match got_command {
             Some(SyncCommand::Shutdown) => return Ok(()),
             Some(SyncCommand::Rebuild) => {
+                events.send(Event::SyncStarted { account }).ok();
                 db.clear_account_messages(account)?;
                 db.reset_folder_sync_state(account)?;
                 let (ids, inbox) = sync_all_folders(db, &mut conn, account, events).await?;
@@ -445,6 +460,7 @@ async fn run_session(
                 }
             }
             Some(SyncCommand::Resync) => {
+                events.send(Event::SyncStarted { account }).ok();
                 let folders: Vec<(String, crate::folder::FolderId)> = folder_ids
                     .iter()
                     .map(|(path, id)| (path.clone(), *id))
@@ -465,6 +481,19 @@ async fn run_session(
                 }
                 // One rebuild for the whole pass, after every folder is in.
                 db.rethread_account(account)?;
+                events.send(Event::SyncFinished { account }).ok();
+            }
+            Some(SyncCommand::RefreshFlags { folder }) => {
+                let path = folder_ids
+                    .iter()
+                    .find_map(|(path, id)| (*id == folder).then(|| path.clone()));
+                if let Some(path) = path {
+                    if let Err(error) =
+                        refresh_folder_flags(db, &mut conn, account, folder, &path, events).await
+                    {
+                        tracing::warn!(account = account.0, folder = %path, %error, "flag refresh failed");
+                    }
+                }
             }
             Some(SyncCommand::SetFlags { message, flags }) => {
                 apply_flags(db, &mut conn, account, message, flags, events).await?;
@@ -551,7 +580,34 @@ async fn run_session(
                 events
                     .send(Event::MessagesChanged { account, folder: folder_id })
                     .ok();
+                // Pick up read/unread changes made elsewhere so the unread
+                // markers stay accurate between full refreshes.
+                if let Err(error) =
+                    refresh_folder_flags(db, &mut conn, account, folder_id, &inbox_path, events)
+                        .await
+                {
+                    tracing::warn!(account = account.0, %error, "inbox flag refresh failed");
+                }
             }
+        }
+
+        // Slower pass over every folder so mail the user is not currently
+        // looking at (archive, Trash, other labels) also reflects server flags.
+        if tokio::time::Instant::now() >= next_flag_refresh {
+            next_flag_refresh = tokio::time::Instant::now() + FLAG_REFRESH_INTERVAL;
+            events.send(Event::SyncStarted { account }).ok();
+            let folders: Vec<(String, FolderId)> = folder_ids
+                .iter()
+                .map(|(path, id)| (path.clone(), *id))
+                .collect();
+            for (path, folder_id) in folders {
+                if let Err(error) =
+                    refresh_folder_flags(db, &mut conn, account, folder_id, &path, events).await
+                {
+                    tracing::warn!(account = account.0, folder = %path, %error, "flag refresh failed");
+                }
+            }
+            events.send(Event::SyncFinished { account }).ok();
         }
         session = Some(conn);
     }
@@ -746,6 +802,56 @@ fn count_unread(db: &Db, folder_id: crate::folder::FolderId) -> Result<u32> {
         .iter()
         .filter(|message| !message.flags.seen)
         .count() as u32)
+}
+
+/// Re-read flags for the newest [`FLAG_REFRESH_WINDOW`] cached messages in a
+/// folder and apply any that changed on the server. Incremental sync only
+/// fetches new UIDs (see [`sync_folder_inner`]), so without this a message
+/// marked read/unread/starred elsewhere keeps a stale flag forever. Returns
+/// whether anything changed; on change it recomputes the folder's unread count
+/// and emits [`Event::MessagesChanged`].
+async fn refresh_folder_flags(
+    db: &Db,
+    session: &mut ImapSession,
+    account: AccountId,
+    folder_id: FolderId,
+    path: &str,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<bool> {
+    let cached = db.folder_flag_state(folder_id, FLAG_REFRESH_WINDOW)?;
+    if cached.is_empty() {
+        return Ok(false);
+    }
+    let remote: Vec<(u32, Flags)> = {
+        let uids: Vec<u32> = cached.iter().map(|(_, uid, _)| *uid).collect();
+        let mut remote = Vec::with_capacity(uids.len());
+        for chunk in uids.chunks(FLAG_REFRESH_CHUNK) {
+            remote.extend(session.fetch_flags(path, chunk).await?);
+        }
+        remote
+    };
+
+    let mut changed = false;
+    for (uid, flags) in remote {
+        if let Some((id, _, current)) = cached.iter().find(|(_, cached_uid, _)| *cached_uid == uid)
+        {
+            if *current != flags {
+                db.set_flags(*id, flags)?;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let unread = count_unread(db, folder_id)?;
+        db.set_folder_unread(folder_id, unread)?;
+        events
+            .send(Event::MessagesChanged {
+                account,
+                folder: folder_id,
+            })
+            .ok();
+    }
+    Ok(changed)
 }
 
 async fn apply_flags(

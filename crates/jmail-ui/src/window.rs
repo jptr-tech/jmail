@@ -969,6 +969,18 @@ pub fn set_view(ui: &Ui, label: &str, filter: ThreadFilter) {
     apply_folder_highlight(ui);
     ui.reload_messages();
     ui.status_label.set_text(&format!("Viewing {label}"));
+    // Re-read flags for the folder the user just opened so read/unread matches
+    // the server (incremental sync never touches already-cached messages).
+    if let ThreadFilter::Folder(id) = filter {
+        if let Ok(Some(folder)) = ui.db.folder(id) {
+            if ui.engine.is_running(folder.account_id) {
+                ui.engine.send(
+                    folder.account_id,
+                    jmail_core::SyncCommand::RefreshFlags { folder: id },
+                );
+            }
+        }
+    }
 }
 
 /// Highlight the sidebar row matching the active view (and clear the rest).

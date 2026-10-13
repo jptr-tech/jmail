@@ -413,6 +413,34 @@ impl ImapSession {
         Ok(messages)
     }
 
+    /// Fetch only the flags for the given UIDs (one round trip). Used to catch
+    /// read/unread/star changes made on the server after a message was cached.
+    pub async fn fetch_flags(&mut self, path: &str, uids: &[u32]) -> Result<Vec<(u32, Flags)>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.select(path).await?;
+        let set = uids
+            .iter()
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let stream = self
+            .session
+            .uid_fetch(set, "(UID FLAGS)")
+            .await
+            .map_err(protocol)?;
+        let mut flags = Vec::new();
+        tokio::pin!(stream);
+        while let Some(fetch) = stream.next().await {
+            let fetch = fetch.map_err(protocol)?;
+            if let Some(uid) = fetch.uid {
+                flags.push((uid, flags_from(&fetch)));
+            }
+        }
+        Ok(flags)
+    }
+
     /// Fetch a complete message by UID.
     pub async fn fetch_full(&mut self, path: &str, uid: u32) -> Result<Option<Vec<u8>>> {
         Ok(self
@@ -714,8 +742,7 @@ fn protocol(error: impl fmt::Display) -> Error {
     Error::Protocol(error.to_string())
 }
 
-fn server_message_from(fetch: Fetch) -> Option<ServerMessage> {
-    let uid = fetch.uid?;
+fn flags_from(fetch: &Fetch) -> Flags {
     let mut flags = Flags::default();
     for flag in fetch.flags() {
         match flag {
@@ -726,6 +753,12 @@ fn server_message_from(fetch: Fetch) -> Option<ServerMessage> {
             _ => {}
         }
     }
+    flags
+}
+
+fn server_message_from(fetch: Fetch) -> Option<ServerMessage> {
+    let uid = fetch.uid?;
+    let flags = flags_from(&fetch);
     let envelope = fetch.envelope()?;
     let date = envelope
         .date

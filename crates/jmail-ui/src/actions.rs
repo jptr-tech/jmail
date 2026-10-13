@@ -1650,7 +1650,11 @@ details.quote { margin: 6px 0; }
 details.quote > summary { cursor: pointer; color: __ACCENT__; }
 details.quote blockquote { margin: 6px 0 0 0; }
 table { border-collapse: collapse; max-width: 100%; }
-th, td { border: 1px solid rgba(127,127,127,0.4); padding: 4px 8px; }
+/* Only outline cells in tables that declare a border: most HTML mail (Outlook,
+   newsletters) uses nested layout tables, and an unconditional rule would box
+   up every element of the message. */
+table[border]:not([border="0"]) th,
+table[border]:not([border="0"]) td { border: 1px solid rgba(127,127,127,0.4); padding: 4px 8px; }
 .thread { padding: 8px 12px 12px; }
 .msg { padding: 12px 0; border-bottom: 1px solid rgba(127,127,127,0.25); }
 .msg:last-child { border-bottom: 0; padding-bottom: 4px; }
