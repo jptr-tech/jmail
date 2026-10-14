@@ -2,6 +2,7 @@
 //! server via IMAP IDLE plus a periodic poll.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -73,9 +74,9 @@ pub enum SyncCommand {
     MoveThread { message: MessageId, to: MoveTarget },
     /// Apply any queued (optimistic) operations for this account now.
     FlushOutbox,
-    /// Re-read read/unread/star flags for a folder's newest messages from the
-    /// server (sent when the user opens the folder).
-    RefreshFlags { folder: FolderId },
+    /// Re-read flags and reconcile deletions for a folder's recent messages
+    /// (sent when the user opens the folder).
+    RefreshFolder { folder: FolderId },
     /// Fetch and cache message bodies (batched per folder).
     FetchBodies { messages: Vec<MessageId> },
     /// Fetch a message and save one of its MIME attachments to a local path.
@@ -483,7 +484,7 @@ async fn run_session(
                 db.rethread_account(account)?;
                 events.send(Event::SyncFinished { account }).ok();
             }
-            Some(SyncCommand::RefreshFlags { folder }) => {
+            Some(SyncCommand::RefreshFolder { folder }) => {
                 let path = folder_ids
                     .iter()
                     .find_map(|(path, id)| (*id == folder).then(|| path.clone()));
@@ -492,6 +493,12 @@ async fn run_session(
                         refresh_folder_flags(db, &mut conn, account, folder, &path, events).await
                     {
                         tracing::warn!(account = account.0, folder = %path, %error, "flag refresh failed");
+                    }
+                    if let Err(error) =
+                        reconcile_folder_deletions(db, &mut conn, account, folder, &path, events)
+                            .await
+                    {
+                        tracing::warn!(account = account.0, folder = %path, %error, "deletion reconcile failed");
                     }
                 }
             }
@@ -588,6 +595,13 @@ async fn run_session(
                 {
                     tracing::warn!(account = account.0, %error, "inbox flag refresh failed");
                 }
+                // Drop mail deleted on another device (EXPUNGE wakes IDLE).
+                if let Err(error) =
+                    reconcile_folder_deletions(db, &mut conn, account, folder_id, &inbox_path, events)
+                        .await
+                {
+                    tracing::warn!(account = account.0, %error, "inbox deletion reconcile failed");
+                }
             }
         }
 
@@ -605,6 +619,12 @@ async fn run_session(
                     refresh_folder_flags(db, &mut conn, account, folder_id, &path, events).await
                 {
                     tracing::warn!(account = account.0, folder = %path, %error, "flag refresh failed");
+                }
+                if let Err(error) =
+                    reconcile_folder_deletions(db, &mut conn, account, folder_id, &path, events)
+                        .await
+                {
+                    tracing::warn!(account = account.0, folder = %path, %error, "deletion reconcile failed");
                 }
             }
             events.send(Event::SyncFinished { account }).ok();
@@ -852,6 +872,53 @@ async fn refresh_folder_flags(
             .ok();
     }
     Ok(changed)
+}
+
+/// Drop cached messages the server has expunged. Incremental sync only ever
+/// adds new UIDs, so a message deleted on another device would otherwise linger
+/// in the cache until a full rebuild. This is purely local: it never sends
+/// `\Deleted`/`EXPUNGE`, so it cannot delete anything server-side.
+///
+/// The folder is only fully re-listed when the server reports fewer messages
+/// than are cached (`EXISTS` vs the cached row count), so an unchanged mailbox
+/// costs one `SELECT` and no UID fetch.
+async fn reconcile_folder_deletions(
+    db: &Db,
+    session: &mut ImapSession,
+    account: AccountId,
+    folder_id: FolderId,
+    path: &str,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<bool> {
+    let cached = db.folder_uids(folder_id)?;
+    if cached.is_empty() {
+        return Ok(false);
+    }
+    let mailbox = session.select(path).await?;
+    if mailbox.exists as usize >= cached.len() {
+        return Ok(false);
+    }
+    let present: HashSet<u32> = session.fetch_uids(path).await?.into_iter().collect();
+    let removed: Vec<MessageId> = cached
+        .iter()
+        .filter(|(_, uid)| !present.contains(uid))
+        .map(|(id, _)| *id)
+        .collect();
+    if removed.is_empty() {
+        // EXISTS dropped but every cached UID is still present (e.g. UIDs were
+        // renumbered without a UIDVALIDITY bump); leave the cache alone.
+        return Ok(false);
+    }
+    db.delete_messages(&removed)?;
+    let unread = count_unread(db, folder_id)?;
+    db.set_folder_counts(folder_id, present.len() as u32, unread)?;
+    events
+        .send(Event::MessagesChanged {
+            account,
+            folder: folder_id,
+        })
+        .ok();
+    Ok(true)
 }
 
 async fn apply_flags(

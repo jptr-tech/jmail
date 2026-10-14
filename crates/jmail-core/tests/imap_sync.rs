@@ -473,7 +473,7 @@ async fn engine_moves_thread_to_named_folder() {
 async fn engine_refreshes_flags_changed_on_server() {
     // Incremental sync only fetches new UIDs, so a message marked unread in
     // another client would keep a stale `\Seen` forever. Opening the folder
-    // asks the engine to re-read flags (see `SyncCommand::RefreshFlags`).
+    // asks the engine to re-read flags (see `SyncCommand::RefreshFolder`).
     let server = start_server(false).await;
     let db = Db::open_in_memory().unwrap();
     let account = db
@@ -530,7 +530,7 @@ async fn engine_refreshes_flags_changed_on_server() {
         .expect("clear seen flag");
     drop(other);
 
-    engine.send(account, SyncCommand::RefreshFlags { folder: archive.id });
+    engine.send(account, SyncCommand::RefreshFolder { folder: archive.id });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -552,6 +552,93 @@ async fn engine_refreshes_flags_changed_on_server() {
         "server-side unread should reach the cache"
     );
     assert_eq!(db.folder(archive.id).unwrap().unwrap().unread, 1);
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_reconciles_messages_deleted_on_server() {
+    // Incremental sync only ever adds UIDs, so mail expunged elsewhere (e.g. on
+    // a phone) must be dropped by the deletion reconcile.
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let inbox = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+    assert_eq!(db.messages_in_folder(inbox.id, 100).unwrap().len(), 5);
+    let doomed = db
+        .messages_in_folder(inbox.id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.subject == "Lunch tomorrow?")
+        .expect("message cached");
+
+    // Another client permanently deletes it on the server.
+    let mut other = ImapSession::connect(
+        settings(server.addr().port(), Security::None),
+        "hunter2",
+        &TlsTrust::system().unwrap(),
+    )
+    .await
+    .expect("second session");
+    other
+        .delete_message(&inbox.path, doomed.uid)
+        .await
+        .expect("delete on server");
+    drop(other);
+
+    engine.send(account, SyncCommand::RefreshFolder { folder: inbox.id });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(
+            event,
+            jmail_core::events::Event::MessagesChanged { folder, .. } if folder == inbox.id
+        ) && db.get_message(doomed.id).unwrap().is_none()
+        {
+            break;
+        }
+    }
+
+    assert!(
+        db.get_message(doomed.id).unwrap().is_none(),
+        "server-side deletion should reach the cache"
+    );
+    assert_eq!(db.messages_in_folder(inbox.id, 100).unwrap().len(), 4);
 
     engine.stop_account(account);
     server.shutdown().await;

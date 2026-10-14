@@ -976,7 +976,7 @@ pub fn set_view(ui: &Ui, label: &str, filter: ThreadFilter) {
             if ui.engine.is_running(folder.account_id) {
                 ui.engine.send(
                     folder.account_id,
-                    jmail_core::SyncCommand::RefreshFlags { folder: id },
+                    jmail_core::SyncCommand::RefreshFolder { folder: id },
                 );
             }
         }

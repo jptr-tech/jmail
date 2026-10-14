@@ -441,6 +441,26 @@ impl ImapSession {
         Ok(flags)
     }
 
+    /// Fetch every UID currently in a folder. Used to reconcile deletions: a
+    /// cached UID missing from here was expunged on the server.
+    pub async fn fetch_uids(&mut self, path: &str) -> Result<Vec<u32>> {
+        self.select(path).await?;
+        let stream = self
+            .session
+            .uid_fetch("1:*", "(UID)")
+            .await
+            .map_err(protocol)?;
+        let mut uids = Vec::new();
+        tokio::pin!(stream);
+        while let Some(fetch) = stream.next().await {
+            let fetch = fetch.map_err(protocol)?;
+            if let Some(uid) = fetch.uid {
+                uids.push(uid);
+            }
+        }
+        Ok(uids)
+    }
+
     /// Fetch a complete message by UID.
     pub async fn fetch_full(&mut self, path: &str, uid: u32) -> Result<Option<Vec<u8>>> {
         Ok(self

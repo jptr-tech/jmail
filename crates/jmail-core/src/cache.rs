@@ -890,10 +890,57 @@ impl Db {
         Ok(())
     }
 
+    /// `(id, uid)` for every cached message in a folder. Used to reconcile
+    /// server-side deletions (`refresh_folder_flags` only re-reads flags).
+    pub fn folder_uids(&self, folder: FolderId) -> Result<Vec<(MessageId, u32)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT id, uid FROM messages WHERE folder_id = ?1")
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![folder.0], |row| {
+                Ok((MessageId(row.get(0)?), row.get::<_, u32>(1)?))
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        Ok(rows)
+    }
+
+    /// Update a folder's total and unread counts (after a deletion reconcile).
+    pub fn set_folder_counts(&self, folder: FolderId, total: u32, unread: u32) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE folders SET total = ?1, unread = ?2 WHERE id = ?3",
+            params![total as i64, unread as i64, folder.0],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
     pub fn delete_message(&self, id: MessageId) -> Result<()> {
         let conn = self.lock()?;
         conn.execute("DELETE FROM messages WHERE id = ?1", params![id.0])
             .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Delete several cached messages in one transaction.
+    pub fn delete_messages(&self, ids: &[MessageId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(storage)?;
+        {
+            let mut stmt = tx
+                .prepare("DELETE FROM messages WHERE id = ?1")
+                .map_err(storage)?;
+            for id in ids {
+                stmt.execute(params![id.0]).map_err(storage)?;
+            }
+        }
+        tx.commit().map_err(storage)?;
         Ok(())
     }
 
