@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::account::{Account, AccountId, AuthKind, Provider, Security};
+use crate::contacts::RecipientStat;
 use crate::error::{Error, Result};
 use crate::folder::{Folder, FolderId, SpecialUse};
 use crate::message::{Address, Attachment, Flags, Message, MessageBody, MessageId, NewMessage};
@@ -531,6 +532,72 @@ impl Db {
             .map_err(storage)?;
         let rows = stmt
             .query_map(params![folder.0, limit], map_message)
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        Ok(rows)
+    }
+
+    /// Recipients of every message in a Sent folder, with how many messages
+    /// used the address and how recently. Only enabled accounts are included.
+    /// Addresses are matched case-insensitively; the newest non-empty name
+    /// wins.
+    ///
+    /// This is the backing store for compose autocomplete. It runs over the
+    /// whole Sent history, so callers should load it off the UI thread.
+    pub fn sent_recipients(&self) -> Result<Vec<RecipientStat>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "WITH recipients AS (
+                     SELECT lower(json_extract(j.value, '$.email')) AS email_key,
+                            json_extract(j.value, '$.email') AS email,
+                            COALESCE(json_extract(j.value, '$.name'), '') AS name,
+                            m.date AS date,
+                            m.id AS message_id
+                     FROM messages m
+                     JOIN folders f ON f.id = m.folder_id
+                     JOIN accounts a ON a.id = m.account_id AND a.enabled = 1
+                     JOIN json_each(m.to_json) j
+                     WHERE f.special_use = ?1
+                     UNION ALL
+                     SELECT lower(json_extract(j.value, '$.email')),
+                            json_extract(j.value, '$.email'),
+                            COALESCE(json_extract(j.value, '$.name'), ''),
+                            m.date,
+                            m.id
+                     FROM messages m
+                     JOIN folders f ON f.id = m.folder_id
+                     JOIN accounts a ON a.id = m.account_id AND a.enabled = 1
+                     JOIN json_each(m.cc_json) j
+                     WHERE f.special_use = ?1
+                 ),
+                 ranked AS (
+                     SELECT email_key, email, name, date, message_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY email_key
+                                ORDER BY (name <> '') DESC, date DESC
+                            ) AS rn
+                     FROM recipients
+                     WHERE email_key IS NOT NULL AND email_key <> ''
+                 )
+                 SELECT MAX(CASE WHEN rn = 1 THEN email END) AS email,
+                        MAX(CASE WHEN rn = 1 THEN name END) AS name,
+                        COUNT(DISTINCT message_id) AS uses,
+                        MAX(date) AS last_used
+                 FROM ranked
+                 GROUP BY email_key
+                 ORDER BY uses DESC, last_used DESC",
+            )
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![SpecialUse::Sent.to_i64()], |row| {
+                Ok(RecipientStat {
+                    address: Address::new(row.get::<_, String>(1)?, row.get::<_, String>(0)?),
+                    uses: row.get::<_, i64>(2)? as u32,
+                    last_used: row.get::<_, i64>(3)?,
+                })
+            })
             .map_err(storage)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage)?;
@@ -2185,6 +2252,85 @@ mod tests {
         db.set_attachments(message.id, &[]).unwrap();
         assert!(db.attachments(message.id).unwrap().is_empty());
         assert!(!db.get_message(message.id).unwrap().unwrap().has_attachments);
+    }
+
+    #[test]
+    fn sent_recipients_merge_usage_recency_and_names() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let account = db.accounts().unwrap()[0].id;
+        let folders = db.folders(account).unwrap();
+        let sent = folders
+            .iter()
+            .find(|folder| folder.special_use == SpecialUse::Sent)
+            .unwrap()
+            .clone();
+        let inbox = folders
+            .iter()
+            .find(|folder| folder.special_use == SpecialUse::Inbox)
+            .unwrap()
+            .clone();
+
+        let mut date = OffsetDateTime::now_utc() - time::Duration::days(3);
+        let mut make = |folder: FolderId, uid: u32, to: Vec<Address>, cc: Vec<Address>| {
+            date += time::Duration::days(1);
+            NewMessage {
+                account_id: account,
+                folder_id: folder,
+                uid,
+                message_id: format!("sent-{uid}@example.org"),
+                thread_id: format!("sent-{uid}"),
+                in_reply_to: String::new(),
+                references: Vec::new(),
+                subject: "Sent".into(),
+                from: Address::new("Me", "me@example.org"),
+                to,
+                cc,
+                reply_to: Vec::new(),
+                date,
+                flags: Flags::default(),
+                snippet: String::new(),
+                has_attachments: false,
+                body_text: None,
+                body_html: None,
+            }
+        };
+
+        db.upsert_message(&make(
+            sent.id,
+            1,
+            vec![Address::new("Ada", "ada@example.org")],
+            vec![Address::new("Carol", "carol@example.org")],
+        ))
+        .unwrap();
+        db.upsert_message(&make(
+            sent.id,
+            2,
+            vec![Address::new("", "ADA@example.org")],
+            vec![Address::new("Bob", "bob@example.org")],
+        ))
+        .unwrap();
+        // Recipients of mail in other folders are not part of the history.
+        db.upsert_message(&make(
+            inbox.id,
+            3,
+            vec![Address::new("Eve", "eve@example.org")],
+            vec![],
+        ))
+        .unwrap();
+
+        let stats = db.sent_recipients().unwrap();
+        let emails: Vec<&str> = stats
+            .iter()
+            .map(|stat| stat.address.email.as_str())
+            .collect();
+        assert_eq!(emails, ["ada@example.org", "bob@example.org", "carol@example.org"]);
+        assert_eq!(stats[0].uses, 2);
+        assert_eq!(stats[0].address.name, "Ada");
+        assert_eq!(stats[1].uses, 1);
+        assert_eq!(stats[1].address.name, "Bob");
+        assert_eq!(stats[2].address.name, "Carol");
+        assert!(stats[0].last_used > stats[2].last_used);
     }
 
     #[test]

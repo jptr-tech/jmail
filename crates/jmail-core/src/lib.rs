@@ -5,6 +5,7 @@
 
 pub mod account;
 pub mod cache;
+pub mod contacts;
 pub mod credentials;
 pub mod error;
 pub mod events;
@@ -22,6 +23,10 @@ pub mod verify;
 
 pub use account::{Account, AccountId, AuthKind, Provider, Security};
 pub use cache::{Db, OpPayload, PendingOp, QueuedMessage, ThreadFilter, ThreadSummary};
+pub use contacts::{
+    accept_suggestion, gnome_contacts, insertable_address, recipient_token, ContactIndex,
+    RecipientStat, RecipientToken,
+};
 pub use credentials::{Credential, Purpose};
 pub use error::{Error, Result};
 pub use events::Event;

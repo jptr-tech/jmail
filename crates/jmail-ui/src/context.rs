@@ -19,6 +19,9 @@ thread_local! {
     /// GTK is single-threaded, so a thread-local is the right home for it (and
     /// keeps [`AppContext`] `Send + Sync` for the `OnceLock`).
     static REFRESH_READING: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// Re-reads the address-book preference and, when re-enabled, loads the
+    /// GNOME contacts again.
+    static REFRESH_CONTACTS: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
 }
 
 /// Install the reading-pane refresh hook (called once from `Ui::new`).
@@ -29,6 +32,21 @@ pub fn set_refresh_reading(hook: Rc<dyn Fn()>) {
 /// Re-render the reading pane, if a hook is installed.
 pub fn refresh_reading() {
     REFRESH_READING.with(|cell| {
+        let hook = cell.borrow().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
+}
+
+/// Install the contact-settings refresh hook (called once from `Ui::new`).
+pub fn set_refresh_contacts(hook: Rc<dyn Fn()>) {
+    REFRESH_CONTACTS.with(|cell| *cell.borrow_mut() = Some(hook));
+}
+
+/// Apply a changed contact preference, if a hook is installed.
+pub fn refresh_contacts() {
+    REFRESH_CONTACTS.with(|cell| {
         let hook = cell.borrow().clone();
         if let Some(hook) = hook {
             hook();

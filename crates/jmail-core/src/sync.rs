@@ -77,6 +77,10 @@ pub enum SyncCommand {
     /// Re-read flags and reconcile deletions for a folder's recent messages
     /// (sent when the user opens the folder).
     RefreshFolder { folder: FolderId },
+    /// Fetch new headers for one special-use folder (currently Sent) without
+    /// touching the rest of the account. Compose uses this to pick up mail
+    /// sent from another device before showing suggestions.
+    SyncSpecial { folder: SpecialUse },
     /// Fetch and cache message bodies (batched per folder).
     FetchBodies { messages: Vec<MessageId> },
     /// Fetch a message and save one of its MIME attachments to a local path.
@@ -499,6 +503,49 @@ async fn run_session(
                             .await
                     {
                         tracing::warn!(account = account.0, folder = %path, %error, "deletion reconcile failed");
+                    }
+                }
+            }
+            Some(SyncCommand::SyncSpecial { folder }) => {
+                match special_folder(db, account, folder)? {
+                    Some((path, folder_id)) => {
+                        // `since_uid = 0` makes the helper continue from the
+                        // folder's cached high-water mark, so this is one cheap
+                        // header fetch of the new messages only.
+                        if let Err(error) =
+                            sync_folder(db, &mut conn, account, folder_id, &path, 0).await
+                        {
+                            tracing::warn!(
+                                account = account.0,
+                                folder = %path,
+                                %error,
+                                "special folder sync failed"
+                            );
+                        } else {
+                            events
+                                .send(Event::MessagesChanged {
+                                    account,
+                                    folder: folder_id,
+                                })
+                                .ok();
+                        }
+                        // IDLE only watches the selected mailbox. Get back to
+                        // the Inbox so push notifications stay instant after a
+                        // composer-triggered Sent refresh.
+                        if let Err(error) = conn.select(&inbox_path).await {
+                            tracing::warn!(
+                                account = account.0,
+                                %error,
+                                "could not re-select the Inbox after a special sync"
+                            );
+                        }
+                    }
+                    None => {
+                        tracing::debug!(
+                            account = account.0,
+                            special = ?folder,
+                            "special folder is not cached"
+                        );
                     }
                 }
             }

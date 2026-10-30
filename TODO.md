@@ -92,7 +92,7 @@ Cache: `~/.var/app/tech.jptr.jmail/data/jmail/cache.db`.
 - [x] Save sent copy to the Sent folder (`APPEND`); mark the answered original `\Answered`.
 - [x] Full draft lifecycle: Save draft + save-on-close, replace-on-resave, reopen by opening a Drafts message, delete on send.
 - [x] Minimal folder views (`g i/t/d/a` / Inbox/Sent/Drafts/All) so Sent and Drafts are reachable and reopenable.
-- [ ] Address autocomplete (ties into M9 contacts) — deferred.
+- [x] Recipient autocomplete in To/Cc/Bcc from Sent history + GNOME address books (EDS, read-only); arrow keys/Enter, per-book timeouts, Composing settings page.
 
 ## M5 — Google OAuth2 / XOAUTH2  ⬜ TODO  ← likely next
 - [ ] Google Cloud "Desktop app" OAuth client, loopback redirect + PKCE, user-supplied id/secret (stored in keyring).
@@ -114,7 +114,7 @@ Cache: `~/.var/app/tech.jptr.jmail/data/jmail/cache.db`.
 - [ ] Search-as-you-type UX, result highlighting, `n`/`N` or `j/k` through results.
 
 ## M8 — Notifications & desktop integration  🟡 PARTIAL
-- [x] Settings pages (Notifications off by default, Reading, Sync, Accounts), desktop entry, metainfo, icon, branding.
+- [x] Settings pages (Notifications off by default, Reading, Composing, Sync, Accounts), desktop entry, metainfo, icon, branding.
 - [ ] Emit `GNotification` on `Event::NewInboxMessage` (Inbox only, grouped per account, click opens the message).
 - [ ] Persist settings (notifications toggle, poll interval, remote images, conversation view) to `Db::settings`; load on startup.
 - [ ] Respect the master + per-account notification toggles.
@@ -125,7 +125,7 @@ Cache: `~/.var/app/tech.jptr.jmail/data/jmail/cache.db`.
 - [ ] App icon: add 256/512 PNG exports for AppStream/Flathub; run `appstreamcli` clean.
 - [ ] Flathub-ready manifest: fully offline (`cargo-sources.json`), lint, remove `--share=network` only if feasible.
 - [ ] Accessibility pass (labels, focus order), dark-theme check.
-- [ ] Contacts / address book (`libfolks`/EDS) — deferred earlier.
+- [x] Contacts / address book: read-only recipient autocomplete from EDS (Sent history + GNOME address books); no contact management.
 - [ ] Rich/HTML compose with formatting toolbar — deferred earlier.
 
 ---
@@ -136,7 +136,8 @@ Cache: `~/.var/app/tech.jptr.jmail/data/jmail/cache.db`.
 - Search covers only the loaded list; folder rows don't switch the view (Joined Inbox only).
 - Snippets are empty until a body is fetched; initial sync fetches **all** headers per folder (no cap yet).
 - Notifications are configured but never emitted.
-- Non-mail engines (calendar, contacts) intentionally out of scope.
+- Calendar engines are out of scope; contacts are read-only and only used for recipient autocomplete.
+- Sent mail from another device is picked up when a composer opens (throttled) or on reconnect/resync; the regular Inbox poll does not fetch non-Inbox headers.
 
 ## Verification checklist (regression)
 - [ ] `cargo test -p jmail-core` (8 unit + 4 integration) green.

@@ -15,13 +15,17 @@ sdk-extensions:
 
 finish-args:
   # Network is required for IMAP/SMTP; the session bus is needed to read the
-  # GNOME Online Accounts configured in System Settings.
+  # GNOME Online Accounts configured in System Settings and the address books
+  # used by recipient autocomplete.
   - --share=network
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri
   - --talk-name=org.freedesktop.secrets
   - --talk-name=org.gnome.OnlineAccounts
+  - --talk-name=org.gnome.evolution.dataserver.Sources5
+  - --talk-name=org.gnome.evolution.dataserver.AddressBook10
+  - --talk-name=org.gnome.evolution.dataserver.Subprocess.Backend.*
   - --filesystem=xdg-download
   - --metadata=X-DConf=migrate-path=/tech/jptr/jmail/
 

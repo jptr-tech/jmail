@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::gio;
@@ -8,11 +9,17 @@ use gtk::glib::BoxedAnyObject;
 use gtk::{Align, Orientation};
 
 use jmail_core::{
-    AccountId, Db, Event, MessageId, SpecialUse, SyncEngine, ThreadFilter, ThreadSummary,
+    AccountId, ContactIndex, Db, Event, MessageId, SpecialUse, SyncCommand, SyncEngine,
+    ThreadFilter, ThreadSummary,
 };
 
 use crate::context::AppContext;
 use crate::message_row::MessageRow;
+
+/// Minimum time between Sent-folder header checks triggered by composing.
+const SENT_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
+/// How long loaded GNOME address books stay fresh.
+const CONTACTS_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 
 /// The main application window and the widgets the actions operate on.
 ///
@@ -75,6 +82,19 @@ pub struct Ui {
     next_compose_id: Rc<Cell<u64>>,
     /// A draft whose body is still being fetched before compose can open.
     pub pending_draft: Rc<RefCell<Option<MessageId>>>,
+    /// Recipient autocomplete data: Sent history plus GNOME address books.
+    /// Kept in memory only; contact details are never written to the cache.
+    pub contacts: Rc<RefCell<ContactIndex>>,
+    /// Whether GNOME contacts are included (the Sent half is always on).
+    contacts_enabled: Rc<Cell<bool>>,
+    contacts_loading: Rc<Cell<bool>>,
+    last_contacts_load: Rc<Cell<Option<Instant>>>,
+    /// Coalesces concurrent Sent-history queries.
+    history_loading: Rc<Cell<bool>>,
+    history_pending: Rc<Cell<bool>>,
+    /// When the Sent folder was last asked for new headers (debounces the
+    /// refresh triggered by opening a composer).
+    last_sent_sync: Rc<Cell<Option<Instant>>>,
 }
 
 impl Ui {
@@ -101,6 +121,11 @@ impl Ui {
         let readable_colors = Rc::new(Cell::new(crate::prefs::get_bool(
             &db,
             crate::prefs::READABLE_COLORS,
+            true,
+        )));
+        let contacts_enabled = Rc::new(Cell::new(crate::prefs::get_bool(
+            &db,
+            crate::prefs::GNOME_ADDRESS_BOOK,
             true,
         )));
 
@@ -218,6 +243,13 @@ impl Ui {
             compose_replies: Rc::new(RefCell::new(HashMap::new())),
             next_compose_id: Rc::new(Cell::new(0)),
             pending_draft: Rc::new(RefCell::new(None)),
+            contacts: Rc::new(RefCell::new(ContactIndex::default())),
+            contacts_enabled,
+            contacts_loading: Rc::new(Cell::new(false)),
+            last_contacts_load: Rc::new(Cell::new(None)),
+            history_loading: Rc::new(Cell::new(false)),
+            history_pending: Rc::new(Cell::new(false)),
+            last_sent_sync: Rc::new(Cell::new(None)),
         };
 
         // The factory needs a `Ui` handle for the row context menu, so it is
@@ -258,12 +290,21 @@ impl Ui {
             let ui = ui.clone();
             crate::context::set_refresh_reading(Rc::new(move || ui.reload_reading_settings()));
         }
+        {
+            let ui = ui.clone();
+            crate::context::set_refresh_contacts(Rc::new(move || ui.reload_contact_settings()));
+        }
 
         ui.connect_widgets();
         ui.reload_folders();
         ui.reload_messages();
         crate::actions::install_window_actions(&ui);
         crate::keys::install(&ui);
+
+        // Warms recipient autocomplete without delaying the window: the Sent
+        // query runs on the blocking pool and the EDS read is async.
+        ui.refresh_contact_history();
+        ui.refresh_gnome_contacts(false);
         ui
     }
 
@@ -333,7 +374,20 @@ impl Ui {
     pub fn handle_event(&self, event: Event) {
         match event {
             Event::FoldersChanged { .. } => self.reload_folders(),
-            Event::MessagesChanged { .. } => crate::actions::schedule_messages_reload(self),
+            Event::MessagesChanged { folder, .. } => {
+                crate::actions::schedule_messages_reload(self);
+                let sent = self
+                    .db
+                    .folder(folder)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|folder| folder.special_use == SpecialUse::Sent);
+                if sent {
+                    // Mail sent from another device just landed in Sent; make
+                    // it available to any composer that is already open.
+                    self.refresh_contact_history();
+                }
+            }
             Event::BodyLoaded { .. } => {
                 // The list itself did not change; only refresh the reading pane.
                 crate::actions::schedule_reload_preview(self);
@@ -352,6 +406,11 @@ impl Ui {
                 }
             }
             Event::SendResult { id, error, .. } => {
+                if error.is_none() {
+                    // `deliver()` has already synced the Sent copy into the
+                    // cache, so the new recipients are visible immediately.
+                    self.refresh_contact_history();
+                }
                 self.deliver_compose(id, crate::compose::ComposeOutcome::Send { error });
             }
             Event::DraftSaved {
@@ -537,6 +596,140 @@ impl Ui {
             true,
         ));
         crate::actions::reload_preview(self);
+    }
+
+    /// Called when a composer opens. Refreshes the Sent side of the index from
+    /// the cache and starts the throttled background refreshes.
+    pub fn prepare_contacts(&self) {
+        self.refresh_contact_history();
+        self.ensure_contacts_fresh();
+    }
+
+    /// Throttled freshness check used by the recipient entries on each
+    /// keystroke. It does no database or D-Bus work until a deadline passes.
+    pub fn ensure_contacts_fresh(&self) {
+        let now = Instant::now();
+        let sent_due = self
+            .last_sent_sync
+            .get()
+            .map(|last| now.duration_since(last) >= SENT_REFRESH_INTERVAL)
+            .unwrap_or(true);
+        if sent_due {
+            self.last_sent_sync.set(Some(now));
+            for account in self
+                .db
+                .accounts()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|account| account.enabled)
+            {
+                if self.engine.is_running(account.id) {
+                    // Ask the worker for Sent headers only; it is a no-op if
+                    // the folder is already current. Never blocks composing.
+                    self.engine.send(
+                        account.id,
+                        SyncCommand::SyncSpecial {
+                            folder: SpecialUse::Sent,
+                        },
+                    );
+                }
+            }
+        }
+
+        if self.contacts_enabled.get() {
+            let contacts_due = self
+                .last_contacts_load
+                .get()
+                .map(|last| now.duration_since(last) >= CONTACTS_REFRESH_INTERVAL)
+                .unwrap_or(true);
+            if contacts_due {
+                self.refresh_gnome_contacts(false);
+            }
+        }
+    }
+
+    /// Re-read the address-book toggle and apply it immediately: switching it
+    /// off drops the in-memory book entries, switching it on reloads them.
+    pub fn reload_contact_settings(&self) {
+        let enabled = crate::prefs::get_bool(&self.db, crate::prefs::GNOME_ADDRESS_BOOK, true);
+        self.contacts_enabled.set(enabled);
+        if enabled {
+            self.refresh_gnome_contacts(true);
+        } else {
+            self.contacts.borrow_mut().book.clear();
+        }
+    }
+
+    fn refresh_gnome_contacts(&self, force: bool) {
+        if !self.contacts_enabled.get() || self.contacts_loading.get() {
+            return;
+        }
+        if !force {
+            if let Some(last) = self.last_contacts_load.get() {
+                if last.elapsed() < CONTACTS_REFRESH_INTERVAL {
+                    return;
+                }
+            }
+        }
+        self.contacts_loading.set(true);
+        let (tx, rx) = async_channel::bounded(1);
+        // A persistent session connection lives for the duration of this call;
+        // EDS cancels remote books as soon as the client goes away.
+        self.runtime.spawn(async move {
+            let result = jmail_core::gnome_contacts().await;
+            let _ = tx.send(result).await;
+        });
+        let ui = self.clone();
+        gtk::glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(book)) => {
+                    tracing::debug!(count = book.len(), "loaded GNOME contacts");
+                    // A toggle-off may have raced this load; never repopulate
+                    // the book after the user disabled it.
+                    if ui.contacts_enabled.get() {
+                        ui.contacts.borrow_mut().book = book;
+                    }
+                }
+                Ok(Err(error)) => tracing::debug!(%error, "could not load GNOME contacts"),
+                Err(_) => {}
+            }
+            // Record failures too, so a session without EDS is retried on the
+            // next refresh window rather than on every composer keystroke.
+            ui.last_contacts_load.set(Some(Instant::now()));
+            ui.contacts_loading.set(false);
+        });
+    }
+
+    /// Rebuild the Sent-recipient half of the autocomplete index. Runs on the
+    /// blocking pool because it scans every Sent message; concurrent requests
+    /// coalesce into one follow-up pass.
+    pub fn refresh_contact_history(&self) {
+        if self.history_loading.get() {
+            self.history_pending.set(true);
+            return;
+        }
+        self.history_loading.set(true);
+        let db = self.db.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        self.runtime.spawn_blocking(move || {
+            let result = ContactIndex::load_history(&db);
+            let _ = tx.send_blocking(result);
+        });
+        let ui = self.clone();
+        gtk::glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(history)) => {
+                    tracing::debug!(count = history.len(), "loaded Sent recipients");
+                    ui.contacts.borrow_mut().history = history;
+                }
+                Ok(Err(error)) => tracing::warn!(%error, "could not load Sent recipients"),
+                Err(_) => {}
+            }
+            ui.history_loading.set(false);
+            if ui.history_pending.replace(false) {
+                ui.refresh_contact_history();
+            }
+        });
     }
 
     /// Reload the message list from the cache (unified inbox, newest first),

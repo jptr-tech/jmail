@@ -1,4 +1,5 @@
 mod actions;
+mod address_entry;
 mod compose;
 mod context;
 mod keys;

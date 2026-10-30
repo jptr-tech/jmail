@@ -1,23 +1,19 @@
 # Jmail
 
-A fast, keyboard-driven GTK4 email client for GNOME, written in Rust with
-gtk-rs + libadwaita. Flatpak app id `tech.jptr.jmail`.
+The best GTK email client (for me at least :p)
 
 ## Features
 
 - Joined Inbox across multiple accounts, adaptive three-pane layout.
-- IMAP receive with **IDLE** push and a 60s fallback poll; local SQLite cache + FTS5.
 - Gmail-style vim keybindings (`j`/`k`, `o`, `e`, `#`, `s`, …).
-- HTML mail rendered with WebKitGTK 6.0 (page scripts disabled, remote images blocked,
-  themed to match the app, auto-sized to content).
-- Compose in **markdown** with live inline styling and a rendered preview; send via
-  SMTP, reply/reply-all/forward, and drafts saved to the server's Drafts folder.
-- Generic IMAP/SMTP with a password, plus sign-in through **GNOME Online
-  Accounts** (Google/Microsoft OAuth2 and IMAP/SMTP passwords).
+- HTML mail rendered with WebKitGTK.
+- Compose in **markdown** with live inline styling and a rendered preview.
+- Recipient autocomplete from people you have sent to and your GNOME address book.
+- GOA integration + custom IMAP support.
 
 ## Requirements
 
-- **Flatpak** (GNOME runtime 50) — for the sandboxed build, or
+- **Flatpak** — for the sandboxed build, or
 - A local toolchain: Rust, plus GTK4, libadwaita, and WebKitGTK development files.
   On Fedora:
 
@@ -32,7 +28,7 @@ gtk-rs + libadwaita. Flatpak app id `tech.jptr.jmail`.
 
 ```sh
 make flatpak     # build + install
-make run         # ...or run the installed app
+make run         # ...or run the cargo crate
 flatpak run tech.jptr.jmail
 ```
 
@@ -119,6 +115,26 @@ yet.
 > GOA is officially aimed at GNOME core applications; third-party access works
 > today but is not a guaranteed interface.
 
+## Recipient autocomplete
+
+The To/Cc/Bcc fields suggest addresses from two places:
+
+- **People you have sent mail to** — read from the cached Sent folders and
+  ranked by how often and how recently you used them.
+- **GNOME address books** — read (read-only) from Evolution Data Server over
+  D-Bus. Only cards with an email address appear; this can be switched off in
+  **Settings → Composing**.
+
+Suggestions update as you type. Use `↑`/`↓` and `Enter`/`Tab` to pick one, or
+`Escape` to dismiss. Opening a composer asks the sync engine to check the Sent
+folder for new headers (at most every two minutes), so mail sent from another
+device shows up without restarting Jmail. Contact data stays in memory and is
+never written to the mail cache or logs.
+
+In the Flatpak sandbox this needs the EDS `Sources5`, `AddressBook10` and
+`Subprocess.Backend.*` talk-name permissions, which are already part of the
+manifest.
+
 ## Adding an account / logging in
 
 1. Launch the app.
@@ -191,11 +207,3 @@ cargo build -p jmail-ui
 ```
 
 See [`TODO.md`](TODO.md) for the roadmap and current status.
-
-## Project layout
-
-- `crates/jmail-core` — engine (no GTK): models, cache, IMAP, sync, secrets.
-- `crates/jmail-ui` — GTK4/libadwaita application (binary `jmail`).
-- `crates/jmail-mock-imap` — mock IMAP server for tests and local use.
-- `data/` — desktop entry, AppStream metadata, icon.
-- `tech.jptr.jmail.yaml` — Flatpak manifest.

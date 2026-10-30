@@ -14,6 +14,7 @@ pub fn present(parent: Option<&impl IsA<gtk::Widget>>) {
     dialog.add(&accounts_page());
     dialog.add(&notifications_page());
     dialog.add(&reading_page());
+    dialog.add(&composing_page());
     dialog.add(&sync_page());
     dialog.add(&advanced_page());
     dialog.present(parent);
@@ -977,6 +978,41 @@ fn reading_page() -> adw::PreferencesPage {
         });
     }
     group.add(&readable);
+
+    page.add(&group);
+    page
+}
+
+fn composing_page() -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Composing")
+        .icon_name("mail-message-new-symbolic")
+        .build();
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Recipient suggestions")
+        .description("Suggest people you have sent mail to, plus contacts from your GNOME address book.")
+        .build();
+
+    let db = crate::context::get().map(|context| context.db.clone());
+
+    let contacts = adw::SwitchRow::builder()
+        .title("Include GNOME contacts")
+        .subtitle("Read-only access to enabled address books; people you have sent to are always included")
+        .build();
+    contacts.set_active(
+        db.as_ref()
+            .map(|db| crate::prefs::get_bool(db, crate::prefs::GNOME_ADDRESS_BOOK, true))
+            .unwrap_or(true),
+    );
+    if let Some(db) = db.clone() {
+        contacts.connect_active_notify(move |row| {
+            crate::prefs::set_bool(&db, crate::prefs::GNOME_ADDRESS_BOOK, row.is_active());
+            // Load or drop the in-memory book entries right away.
+            crate::context::refresh_contacts();
+        });
+    }
+    group.add(&contacts);
 
     page.add(&group);
     page

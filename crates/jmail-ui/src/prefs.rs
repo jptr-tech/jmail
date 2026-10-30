@@ -11,6 +11,7 @@ pub const NOTIFICATIONS_INBOX_ONLY: &str = "notifications.inbox_only";
 pub const NOTIFICATIONS_GROUP: &str = "notifications.group_by_account";
 pub const REMOTE_IMAGES: &str = "reading.load_remote_images";
 pub const READABLE_COLORS: &str = "reading.force_readable_colors";
+pub const GNOME_ADDRESS_BOOK: &str = "compose.gnome_address_book";
 pub const POLL_INTERVAL: &str = "sync.poll_interval";
 
 pub fn get_bool(db: &Db, key: &str, default: bool) -> bool {

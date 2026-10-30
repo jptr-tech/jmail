@@ -1271,6 +1271,78 @@ async fn rebuild_clears_and_refetches_from_server() {
     server.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn special_sync_picks_up_sent_mail_from_another_client() {
+    let server = start_server(false).await;
+    let (db, account) = account_with_smtp(&server).await;
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+    wait_for_sync_finished(&mut events).await;
+
+    // The demo Sent copy was synced at startup.
+    assert!(db
+        .sent_recipients()
+        .unwrap()
+        .iter()
+        .any(|stat| stat.address.email == "ada@example.org"));
+
+    // Another client (phone/webmail) appends a message to Sent on the server.
+    // The regular Inbox poll intentionally does not fetch Sent headers, so this
+    // is exactly the gap `SyncSpecial` closes when a composer opens.
+    server
+        .push(
+            "Sent",
+            MockMessage::new(
+                "Notes for the team",
+                "You",
+                "you@example.com",
+                &[("New Person", "new@example.net")],
+                "sent-from-elsewhere@example.com",
+                "Tue, 06 Oct 2026 12:00:00 +0000",
+                "Sent from my phone.",
+                &["\\Seen"],
+            ),
+        )
+        .await;
+
+    engine.send(
+        account,
+        SyncCommand::SyncSpecial {
+            folder: SpecialUse::Sent,
+        },
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if db
+            .sent_recipients()
+            .unwrap()
+            .iter()
+            .any(|stat| stat.address.email == "new@example.net")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "special Sent sync did not fetch the new message"
+        );
+        let _ = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline");
+    }
+
+    let stats = db.sent_recipients().unwrap();
+    let new = stats
+        .iter()
+        .find(|stat| stat.address.email == "new@example.net")
+        .expect("new recipient");
+    assert_eq!(new.address.name, "New Person");
+    assert_eq!(new.uses, 1);
+
+    engine.stop_account(account);
+    server.shutdown().await;
+}
+
 /// Insert a generic account wired to the mock's IMAP and SMTP listeners.
 async fn account_with_smtp(server: &MockServer) -> (Db, jmail_core::AccountId) {
     let db = Db::open_in_memory().unwrap();

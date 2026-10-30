@@ -14,6 +14,7 @@ use jmail_core::{
     OutgoingMessage, SyncCommand,
 };
 
+use crate::address_entry::AddressEntry;
 use crate::markdown_editor::MarkdownEditor;
 use crate::message_row::format_timestamp;
 use crate::window::Ui;
@@ -53,15 +54,15 @@ pub enum ComposeOutcome {
 
 /// A reusable composer widget.
 struct Composer {
-    root: gtk::Box,
+    root: gtk::Overlay,
     actions: gtk::Box,
     id: u64,
     mode: Mode,
     accounts: Vec<Account>,
     from: gtk::DropDown,
-    to: gtk::Entry,
-    cc: gtk::Entry,
-    bcc: gtk::Entry,
+    to: AddressEntry,
+    cc: AddressEntry,
+    bcc: AddressEntry,
     subject: gtk::Entry,
     editor: MarkdownEditor,
     banner: gtk::Label,
@@ -78,6 +79,9 @@ struct Composer {
 
 impl Composer {
     fn new(ui: &Ui, mode: Mode, target: Option<Message>, compact: bool) -> Rc<Self> {
+        // Warm the shared recipient index and kick off the throttled Sent
+        // refresh; both are asynchronous and never delay the composer.
+        ui.prepare_contacts();
         let all_accounts = ui.db.accounts().unwrap_or_default();
         let accounts: Vec<Account> = all_accounts
             .iter()
@@ -101,9 +105,9 @@ impl Composer {
         );
         from.set_selected(default_index as u32);
 
-        let to = gtk::Entry::builder().placeholder_text("To").build();
-        let cc = gtk::Entry::builder().placeholder_text("Cc").build();
-        let bcc = gtk::Entry::builder().placeholder_text("Bcc").build();
+        let to = AddressEntry::new(ui, "To");
+        let cc = AddressEntry::new(ui, "Cc");
+        let bcc = AddressEntry::new(ui, "Bcc");
         let subject = gtk::Entry::builder().placeholder_text("Subject").build();
 
         let mut draft_ref: Option<DraftRef> = None;
@@ -159,8 +163,8 @@ impl Composer {
         let show_bcc = !compact;
         let show_subject = !compact;
         let show_from = !compact || accounts.len() > 1;
-        cc.set_visible(show_cc);
-        bcc.set_visible(show_bcc);
+        cc.entry.set_visible(show_cc);
+        bcc.entry.set_visible(show_bcc);
         subject.set_visible(show_subject);
 
         let from_label = gtk::Label::builder().label("From").xalign(0.0).build();
@@ -181,9 +185,9 @@ impl Composer {
         header.set_margin_start(margin);
         header.set_margin_end(margin);
         header.append(&from_row);
-        header.append(&to);
-        header.append(&cc);
-        header.append(&bcc);
+        header.append(&to.entry);
+        header.append(&cc.entry);
+        header.append(&bcc.entry);
         header.append(&subject);
 
         // Attachment chips for forwarded mail.
@@ -225,16 +229,24 @@ impl Composer {
         actions.append(&save);
         actions.append(&send);
 
-        let root = gtk::Box::new(Orientation::Vertical, 0);
-        root.add_css_class("composer");
-        root.append(&header);
-        root.append(&gtk::Separator::new(Orientation::Horizontal));
-        root.append(&editor.container);
-        root.append(&gtk::Separator::new(Orientation::Horizontal));
-        root.append(&actions);
+        let content = gtk::Box::new(Orientation::Vertical, 0);
+        content.add_css_class("composer");
+        content.append(&header);
+        content.append(&gtk::Separator::new(Orientation::Horizontal));
+        content.append(&editor.container);
+        content.append(&gtk::Separator::new(Orientation::Horizontal));
+        content.append(&actions);
+
+        // Suggestions float above the composer fields instead of pushing them
+        // around. Overlay children do not participate in layout measurement.
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&content));
+        to.attach_overlay(&overlay);
+        cc.attach_overlay(&overlay);
+        bcc.attach_overlay(&overlay);
 
         Rc::new(Self {
-            root,
+            root: overlay,
             actions,
             id: ui.register_compose(),
             mode,
@@ -331,9 +343,9 @@ impl Composer {
         OutgoingMessage {
             message_id: self.message_id.borrow().clone(),
             from: Address::new(account.display_name.clone(), account.email.clone()),
-            to: parse_address_list(&self.to.text()),
-            cc: parse_address_list(&self.cc.text()),
-            bcc: parse_address_list(&self.bcc.text()),
+            to: parse_address_list(&self.to.entry.text()),
+            cc: parse_address_list(&self.cc.entry.text()),
+            bcc: parse_address_list(&self.bcc.entry.text()),
             subject: self.subject.text().to_string(),
             markdown: self.editor.text(),
             in_reply_to,
