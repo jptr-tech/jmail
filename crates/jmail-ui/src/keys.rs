@@ -61,9 +61,10 @@ pub fn install(ui: &Ui) {
             return Propagation::Stop;
         }
 
-        let action: Option<&str> = if ctrl && key == gdk::Key::Return {
-            Some("win.send")
-        } else if shift && key == gdk::Key::I {
+        // Ctrl+Enter is handled by the composer's own capture-phase
+        // controller (which owns the send action), so it must fall through the
+        // window layer even when focus is on a non-text widget in the composer.
+        let action: Option<&str> = if shift && key == gdk::Key::I {
             Some("win.mark-read")
         } else if shift && key == gdk::Key::U {
             Some("win.mark-unread")
@@ -73,7 +74,8 @@ pub fn install(ui: &Ui) {
             match key {
                 gdk::Key::j | gdk::Key::Down => Some("win.next-message"),
                 gdk::Key::k | gdk::Key::Up => Some("win.prev-message"),
-                gdk::Key::o | gdk::Key::Return => Some("win.open-window"),
+                gdk::Key::o => Some("win.open-window"),
+                gdk::Key::Return if !ctrl && !shift => Some("win.open-window"),
                 gdk::Key::u | gdk::Key::Escape => Some("win.back"),
                 gdk::Key::c if !ctrl => Some("win.compose"),
                 gdk::Key::r => Some("win.reply"),

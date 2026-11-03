@@ -103,7 +103,7 @@ pub fn shortcuts(parent: Option<&impl IsA<gtk::Widget>>) {
             ("Reply", "r"),
             ("Reply all", "a"),
             ("Forward", "f"),
-            ("Send", "<Shift>Return"),
+            ("Send", "<Ctrl>Return"),
         ],
     ));
     dialog.add(section(

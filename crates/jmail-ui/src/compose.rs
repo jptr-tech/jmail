@@ -292,17 +292,16 @@ impl Composer {
                 .connect_toggled(move |button| composer.editor.set_preview(button.is_active()));
         }
         {
-            // Shift/Ctrl+Enter sends. Use a capture-phase controller so it works
+            // Ctrl+Enter sends. Use a capture-phase controller so it works
             // while the editor has focus (Return would otherwise insert a
-            // newline). Ctrl+C etc. are left alone for the editor to handle.
+            // newline); plain Enter and Shift+Enter are left to the editor so
+            // they insert a line break. Ctrl+C etc. also fall through.
             let ui = ui.clone();
             let composer = self.clone();
             let controller = gtk::EventControllerKey::new();
             controller.set_propagation_phase(gtk::PropagationPhase::Capture);
             controller.connect_key_pressed(move |_, key, _, state| {
-                let send_mod = state.contains(gtk::gdk::ModifierType::SHIFT_MASK)
-                    || state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-                if send_mod && matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter) {
+                if is_send_shortcut(key, state) {
                     composer.submit(&ui);
                     gtk::glib::Propagation::Stop
                 } else {
@@ -620,6 +619,12 @@ pub fn present_inline(
     pane.scroll_to_bottom();
 }
 
+/// Ctrl+Enter sends. Plain Enter and Shift+Enter are editor input (newline).
+fn is_send_shortcut(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
+    state.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        && matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+}
+
 fn display_address_list(addresses: &[Address]) -> String {
     addresses
         .iter()
@@ -673,4 +678,24 @@ fn forward_body(target: &Message, body: Option<&str>) -> String {
         markdown.push('\n');
     }
     markdown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_send_shortcut;
+    use gtk::gdk::{Key, ModifierType};
+
+    #[test]
+    fn ctrl_enter_sends() {
+        assert!(is_send_shortcut(Key::Return, ModifierType::CONTROL_MASK));
+        assert!(is_send_shortcut(Key::KP_Enter, ModifierType::CONTROL_MASK));
+    }
+
+    #[test]
+    fn plain_and_shift_enter_do_not_send() {
+        assert!(!is_send_shortcut(Key::Return, ModifierType::empty()));
+        assert!(!is_send_shortcut(Key::KP_Enter, ModifierType::empty()));
+        assert!(!is_send_shortcut(Key::Return, ModifierType::SHIFT_MASK));
+        assert!(!is_send_shortcut(Key::KP_Enter, ModifierType::SHIFT_MASK));
+    }
 }
