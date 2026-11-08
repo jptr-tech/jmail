@@ -641,26 +641,41 @@ impl Db {
             ThreadFilter::All => ("WHERE (?1 IS NULL)", None),
         };
         let sql = format!(
-            "WITH filtered AS (
-                    SELECT {MESSAGE_COLUMNS}, f.special_use AS folder_special
+            "WITH matched AS (
+                    SELECT m.id AS id, m.account_id AS account_id, m.thread_id AS thread_id
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
                     JOIN accounts a ON a.id = m.account_id AND a.enabled = 1
                     {filter_where}
+                 ),
+                 selected AS (
+                    SELECT DISTINCT account_id, thread_id FROM matched
+                 ),
+                 thread_messages AS (
+                    SELECT {MESSAGE_COLUMNS}, f.special_use AS folder_special,
+                           CASE WHEN mm.id IS NULL THEN 0 ELSE 1 END AS in_filter
+                    FROM messages m
+                    JOIN folders f ON f.id = m.folder_id
+                    JOIN accounts a ON a.id = m.account_id AND a.enabled = 1
+                    JOIN selected s
+                      ON s.account_id = m.account_id AND s.thread_id = m.thread_id
+                    LEFT JOIN matched mm ON mm.id = m.id
                  ),
                  deduped AS (
                     SELECT m.*,
                            ROW_NUMBER() OVER (
                                PARTITION BY m.account_id,
                                    CASE WHEN m.message_id = '' THEN 'id:' || m.id ELSE m.message_id END
-                               ORDER BY (m.folder_special = ?2) DESC, m.id ASC
+                               ORDER BY m.in_filter DESC,
+                                        (m.folder_special = ?2) DESC, m.id ASC
                            ) AS dedup_rn
-                    FROM filtered m
+                    FROM thread_messages m
                  ),
                  ranked AS (
                     SELECT {MESSAGE_COLUMNS},
                            ROW_NUMBER() OVER (PARTITION BY m.account_id, m.thread_id
-                                              ORDER BY m.date DESC, m.id DESC) AS rn,
+                                              ORDER BY m.in_filter DESC,
+                                                       m.date DESC, m.id DESC) AS rn,
                            COUNT(*) OVER (PARTITION BY m.account_id, m.thread_id) AS total,
                            SUM(CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END)
                                OVER (PARTITION BY m.account_id, m.thread_id) AS unread,
@@ -2274,6 +2289,99 @@ mod tests {
             .find(|t| t.message.thread_id == "conv-root@t")
             .unwrap();
         assert_eq!(thread.starred, 2);
+    }
+
+    #[test]
+    fn thread_counts_span_every_folder() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let account = db.accounts().unwrap()[0].id;
+        let folders = db.folders(account).unwrap();
+        let inbox = folders
+            .iter()
+            .find(|folder| folder.special_use == SpecialUse::Inbox)
+            .unwrap()
+            .id;
+        let sent = folders
+            .iter()
+            .find(|folder| folder.special_use == SpecialUse::Sent)
+            .unwrap()
+            .id;
+        let archive = folders
+            .iter()
+            .find(|folder| folder.special_use == SpecialUse::Archive)
+            .unwrap()
+            .id;
+
+        let make = |uid: u32, folder: FolderId, id: &str, date: i64, seen: bool| NewMessage {
+            account_id: account,
+            folder_id: folder,
+            uid,
+            message_id: id.into(),
+            thread_id: "span@t".into(),
+            in_reply_to: String::new(),
+            references: Vec::new(),
+            subject: "Spanning thread".into(),
+            from: Address::new("Sender", "sender@example.org"),
+            to: vec![],
+            cc: vec![],
+            reply_to: Vec::new(),
+            date: OffsetDateTime::from_unix_timestamp(date).unwrap(),
+            flags: Flags {
+                seen,
+                ..Flags::default()
+            },
+            snippet: "hi".into(),
+            has_attachments: false,
+            body_text: None,
+            body_html: None,
+        };
+
+        let inbox_id = db
+            .upsert_message(&make(900, inbox, "span-in@t", 1_700_000_000, false))
+            .unwrap();
+        let sent_id = db
+            .upsert_message(&make(901, sent, "span-sent@t", 1_700_000_060, true))
+            .unwrap();
+        db.upsert_message(&make(902, archive, "span-arc@t", 1_700_000_120, true))
+            .unwrap();
+        db.set_flags(
+            sent_id,
+            Flags {
+                seen: true,
+                flagged: true,
+                ..Flags::default()
+            },
+        )
+        .unwrap();
+
+        // The Inbox view lists the thread but counts every folder's copy.
+        let unified = db.threads(ThreadFilter::Unified, 200).unwrap();
+        let thread = unified
+            .iter()
+            .find(|thread| thread.message.thread_id == "span@t")
+            .expect("thread in the Inbox view");
+        assert_eq!(thread.count, 3);
+        assert_eq!(thread.unread, 1);
+        assert_eq!(thread.starred, 1);
+        // The row still represents the latest *Inbox* message, not the newer
+        // Sent/Archive ones.
+        assert_eq!(thread.message.id, inbox_id);
+
+        let sent_view = db.threads(ThreadFilter::Folder(sent), 200).unwrap();
+        let thread = sent_view
+            .iter()
+            .find(|thread| thread.message.thread_id == "span@t")
+            .expect("thread in the Sent view");
+        assert_eq!(thread.count, 3);
+        assert_eq!(thread.message.id, sent_id);
+
+        let all = db.threads(ThreadFilter::All, 200).unwrap();
+        let thread = all
+            .iter()
+            .find(|thread| thread.message.thread_id == "span@t")
+            .expect("thread in the All view");
+        assert_eq!(thread.count, 3);
     }
 
     #[test]
