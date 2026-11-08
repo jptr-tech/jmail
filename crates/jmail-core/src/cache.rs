@@ -985,6 +985,34 @@ impl Db {
         Ok(())
     }
 
+    /// IDs of messages among the newest `limit` in a folder that still need
+    /// their bodies, newest first. Used by background prefetch.
+    pub fn messages_missing_bodies(
+        &self,
+        folder: FolderId,
+        limit: u32,
+    ) -> Result<Vec<MessageId>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM (
+                     SELECT id, date, body_loaded FROM messages
+                     WHERE folder_id = ?1
+                     ORDER BY date DESC, id DESC
+                     LIMIT ?2
+                 )
+                 WHERE body_loaded = 0
+                 ORDER BY date DESC, id DESC",
+            )
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![folder.0, limit], |row| Ok(MessageId(row.get(0)?)))
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        Ok(rows)
+    }
+
     pub fn delete_message(&self, id: MessageId) -> Result<()> {
         let conn = self.lock()?;
         conn.execute("DELETE FROM messages WHERE id = ?1", params![id.0])
@@ -2032,6 +2060,35 @@ mod tests {
         // as loaded, so it is not re-fetched forever.
         db.set_body(message.id, None, None, "").unwrap();
         assert!(db.body_loaded(message.id).unwrap());
+    }
+
+    #[test]
+    fn prefetch_candidates_are_newest_unloaded_within_window() {
+        let db = db();
+        db.seed_demo().unwrap();
+        let account = db.accounts().unwrap()[0].id;
+        let inbox = db
+            .folders(account)
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.special_use == SpecialUse::Inbox)
+            .unwrap();
+        let messages = db.messages_in_folder(inbox.id, 10).unwrap();
+        assert!(messages.len() >= 3);
+
+        let candidates = db.messages_missing_bodies(inbox.id, 10).unwrap();
+        let expected: Vec<MessageId> = messages.iter().map(|message| message.id).collect();
+        assert_eq!(candidates, expected, "newest first, all unloaded");
+
+        db.set_body(messages[0].id, Some("body"), None, "body")
+            .unwrap();
+        let candidates = db.messages_missing_bodies(inbox.id, 10).unwrap();
+        assert!(!candidates.contains(&messages[0].id));
+        assert_eq!(candidates[0], messages[1].id);
+
+        // The window is applied before loaded bodies are filtered out.
+        let narrow = db.messages_missing_bodies(inbox.id, 2).unwrap();
+        assert_eq!(narrow, vec![messages[1].id]);
     }
 
     #[test]

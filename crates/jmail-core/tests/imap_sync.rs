@@ -275,8 +275,8 @@ async fn background_prefetch_warms_inbox_bodies() {
         .find(|folder| folder.special_use == SpecialUse::Inbox)
         .unwrap();
 
-    // Prefetch starts a few seconds after entering IDLE; the whole 5-message
-    // Inbox fits in the first batch.
+    // Prefetch starts as soon as the initial sync enters IDLE; the whole
+    // 5-message Inbox fits in the first batch.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     loop {
         let loaded = db
@@ -294,6 +294,82 @@ async fn background_prefetch_warms_inbox_bodies() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_prefetch_picks_up_new_inbox_mail() {
+    let server = start_server(false).await;
+    let db = Db::open_in_memory().unwrap();
+    let account = db
+        .insert_account(&{
+            let mut account = Account::generic("you@example.com");
+            account.imap_host = "127.0.0.1".to_string();
+            account.imap_port = server.addr().port();
+            account.imap_security = Security::None;
+            account.username = "you@example.com".to_string();
+            account
+        })
+        .unwrap();
+    jmail_core::secrets::store_password(&db, account, "hunter2").unwrap();
+
+    let (engine, mut events) = SyncEngine::start(db.clone());
+    engine.start_account(account).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event before deadline")
+            .expect("channel open");
+        if matches!(event, jmail_core::events::Event::SyncFinished { .. }) {
+            break;
+        }
+    }
+
+    let inbox = db
+        .folders(account)
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.special_use == SpecialUse::Inbox)
+        .unwrap();
+
+    // Mail that arrives after the worker's initial queue was built must still
+    // be prefetched (the old one-shot queue missed it forever).
+    server
+        .push(
+            "INBOX",
+            MockMessage::new(
+                "Fresh arrival",
+                "Ada Lovelace",
+                "ada@example.org",
+                &[("You", "you@example.com")],
+                "fresh@example.org",
+                "Thu, 05 Nov 2026 10:00:00 +0000",
+                "This body should be prefetched without opening it.",
+                &[],
+            ),
+        )
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let fresh = db
+            .messages_in_folder(inbox.id, 100)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.subject == "Fresh arrival");
+        if fresh.is_some_and(|message| db.body_loaded(message.id).unwrap_or(false)) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "new Inbox mail was not prefetched"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    engine.stop_account(account);
     server.shutdown().await;
 }
 

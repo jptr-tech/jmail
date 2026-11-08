@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -22,14 +21,17 @@ use crate::message::{Attachment, Flags, MessageId};
 use crate::outgoing::{DraftRef, OutgoingAttachment, OutgoingMessage};
 use crate::smtp::{self, SmtpSettings};
 
-/// How many of the newest Inbox messages to warm in the background.
-const PREFETCH_LIMIT: u32 = 100;
-/// Messages fetched per background prefetch batch.
-const PREFETCH_CHUNK: usize = 5;
-/// Pause between background prefetch batches so user actions take priority.
-const PREFETCH_COOLDOWN: Duration = Duration::from_secs(5);
-/// Let the initial sync settle before background prefetch starts.
-const PREFETCH_START_DELAY: Duration = Duration::from_secs(5);
+/// How many of the newest Inbox messages are considered for background body
+/// prefetch. Bodies are fetched newest-first, so the mail most likely to be
+/// opened is ready first.
+const PREFETCH_SCAN: u32 = 500;
+/// Messages fetched per background prefetch batch (one IMAP round trip).
+const PREFETCH_CHUNK: usize = 10;
+/// Pause between prefetch batches while there is more to fetch, so queued user
+/// actions still get a turn on the shared connection.
+const PREFETCH_COOLDOWN: Duration = Duration::from_millis(250);
+/// How long to wait before re-checking once the prefetch window is warm.
+const PREFETCH_IDLE_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a queued operation keeps retrying transient failures before the
 /// engine rolls it back locally.
 const OP_FAIL_WINDOW: Duration = Duration::from_secs(60);
@@ -344,17 +346,10 @@ async fn run_session(
 
     let mut session = Some(session);
     let mut first_idle = true;
-    // Warm the newest Inbox bodies in the background, a small batch at a time,
-    // so opening recent mail is instant (and the list gets snippets).
-    let mut prefetch: VecDeque<MessageId> = prefetch_queue(db, account).into();
-    if !prefetch.is_empty() {
-        tracing::debug!(
-            account = account.0,
-            queued = prefetch.len(),
-            "queueing background body prefetch"
-        );
-    }
-    let mut next_prefetch = tokio::time::Instant::now() + PREFETCH_START_DELAY;
+    // Warm the newest Inbox bodies in the background so opening recent mail is
+    // instant (and the list gets snippets). The batch is recomputed from the
+    // cache each time, so mail that arrives after startup is picked up too.
+    let mut next_prefetch = tokio::time::Instant::now();
     // Slower full-folder flag refresh; the Inbox is refreshed on every poll.
     let mut next_flag_refresh = tokio::time::Instant::now() + FLAG_REFRESH_INTERVAL;
     loop {
@@ -407,7 +402,7 @@ async fn run_session(
                         }
                     }
                     _ = tokio::time::sleep_until(deadline) => break None, // poll tick
-                    _ = tokio::time::sleep_until(next_prefetch), if !prefetch.is_empty() => {
+                    _ = tokio::time::sleep_until(next_prefetch) => {
                         prefetch_now = true;
                         break None;
                     }
@@ -436,18 +431,46 @@ async fn run_session(
         }
 
         if prefetch_now {
-            if db.has_pending_ops(account).unwrap_or(false) {
-                // Let queued user actions go first; try prefetch again later.
+            // Let queued user actions go first, but only when one is actually
+            // due: a failed op sitting in retry backoff must not starve prefetch.
+            let op_now = OffsetDateTime::now_utc().unix_timestamp();
+            let op_due = db
+                .pending_ops(account)
+                .unwrap_or_default()
+                .iter()
+                .any(|op| op.next_attempt <= op_now);
+            if op_due {
                 next_prefetch = tokio::time::Instant::now() + PREFETCH_COOLDOWN;
                 session = Some(conn);
                 continue;
             }
-            let count = prefetch.len().min(PREFETCH_CHUNK);
-            let chunk: Vec<MessageId> = prefetch.drain(..count).collect();
+            let Some(folder_id) = folder_ids.get(&inbox_path).copied() else {
+                next_prefetch = tokio::time::Instant::now() + PREFETCH_IDLE_INTERVAL;
+                session = Some(conn);
+                continue;
+            };
+            // Recompute every batch so mail that arrived after startup is
+            // included automatically.
+            let batch = db
+                .messages_missing_bodies(folder_id, PREFETCH_SCAN)
+                .unwrap_or_default();
+            let count = batch.len().min(PREFETCH_CHUNK);
+            if count == 0 {
+                next_prefetch = tokio::time::Instant::now() + PREFETCH_IDLE_INTERVAL;
+                session = Some(conn);
+                continue;
+            }
+            let chunk = batch[..count].to_vec();
             if let Err(error) = apply_fetch_bodies(db, &mut conn, account, chunk, events).await {
                 tracing::warn!(account = account.0, %error, "background prefetch failed");
             }
-            next_prefetch = tokio::time::Instant::now() + PREFETCH_COOLDOWN;
+            // Keep going while the window is still cold; back off once warm.
+            next_prefetch = tokio::time::Instant::now()
+                + if count == PREFETCH_CHUNK {
+                    PREFETCH_COOLDOWN
+                } else {
+                    PREFETCH_IDLE_INTERVAL
+                };
             session = Some(conn);
             continue;
         }
@@ -463,6 +486,8 @@ async fn run_session(
                 if let Some(path) = inbox {
                     inbox_path = path;
                 }
+                // Warm the rebuilt Inbox bodies as soon as possible.
+                next_prefetch = tokio::time::Instant::now();
             }
             Some(SyncCommand::Resync) => {
                 events.send(Event::SyncStarted { account }).ok();
@@ -487,6 +512,7 @@ async fn run_session(
                 // One rebuild for the whole pass, after every folder is in.
                 db.rethread_account(account)?;
                 events.send(Event::SyncFinished { account }).ok();
+                next_prefetch = tokio::time::Instant::now();
             }
             Some(SyncCommand::RefreshFolder { folder }) => {
                 let path = folder_ids
@@ -649,6 +675,8 @@ async fn run_session(
                 {
                     tracing::warn!(account = account.0, %error, "inbox deletion reconcile failed");
                 }
+                // New mail (or a fresh poll) should be warmed promptly.
+                next_prefetch = tokio::time::Instant::now();
             }
         }
 
@@ -678,29 +706,6 @@ async fn run_session(
         }
         session = Some(conn);
     }
-}
-
-/// The newest Inbox messages that still need bodies, newest first, capped at
-/// [`PREFETCH_LIMIT`].
-fn prefetch_queue(db: &Db, account: AccountId) -> Vec<MessageId> {
-    let Ok(folders) = db.folders(account) else {
-        return Vec::new();
-    };
-    let Some(inbox) = folders
-        .into_iter()
-        .find(|folder| folder.special_use == SpecialUse::Inbox)
-    else {
-        return Vec::new();
-    };
-    let Ok(messages) = db.messages_in_folder(inbox.id, PREFETCH_LIMIT) else {
-        return Vec::new();
-    };
-    messages
-        .into_iter()
-        .filter(|message| matches!(db.body_loaded(message.id), Ok(false)))
-        .map(|message| message.id)
-        .take(PREFETCH_LIMIT as usize)
-        .collect()
 }
 
 /// List folders, upsert them into the cache, and fetch headers for each from
