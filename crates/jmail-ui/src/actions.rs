@@ -1068,12 +1068,37 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Wrap each top-level `<blockquote>` in a collapsible `<details>`.
+/// Client-specific wrappers around quoted history. There is no standard for
+/// this: `<blockquote>` is the de facto convention, but the big clients each
+/// invented their own container. The first wrapper found (outside an existing
+/// quote) marks the start of the history; the rest of the body is folded into
+/// one expander.
+const QUOTE_WRAPPERS: &[&str] = &[
+    "mail-editor-reference-message-container", // Outlook web/mobile/new Outlook
+    "mail-editor-reference-message-body",      // Outlook fallback
+    "appendonsend",                            // Outlook desktop
+    "divrplyfwdmsg",                           // Outlook desktop header
+    "gmail_quote",                             // Gmail
+    "yahoo_quoted",                            // Yahoo
+    "moz-cite-prefix",                         // Thunderbird
+    "protonmail_quote",                        // Proton Mail
+];
+
+/// Whether an opening tag starts a quoted-history wrapper.
+fn opens_quote_wrapper(lower_tag: &str) -> bool {
+    !lower_tag.starts_with("</") && QUOTE_WRAPPERS.iter().any(|marker| lower_tag.contains(marker))
+}
+
+/// Wrap quoted history in a collapsible `<details>`: either a top-level
+/// `<blockquote>` (the de facto standard) or one of the client-specific
+/// [`QUOTE_WRAPPERS`], after which the remainder of the body is quoted history.
 fn collapse_quotes(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len() + 64);
     let mut cursor = 0;
     let mut depth: i32 = 0;
+    // Set once a client-specific wrapper opened: everything after it is folded.
+    let mut history = false;
     while cursor < html.len() {
         let Some(rel) = lower[cursor..].find('<') else {
             out.push_str(&html[cursor..]);
@@ -1087,7 +1112,9 @@ fn collapse_quotes(html: &str) -> String {
         };
         let tag = &html[start..end];
         let lower_tag = &lower[start..end];
-        if tag_name(lower_tag).as_deref() == Some("blockquote") {
+        if history {
+            out.push_str(tag);
+        } else if tag_name(lower_tag).as_deref() == Some("blockquote") {
             if lower_tag.starts_with("</") {
                 out.push_str(tag);
                 depth = (depth - 1).max(0);
@@ -1103,10 +1130,17 @@ fn collapse_quotes(html: &str) -> String {
                 depth += 1;
                 out.push_str(tag);
             }
+        } else if depth == 0 && opens_quote_wrapper(lower_tag) {
+            out.push_str("<details class=\"quote\"><summary>Show quoted text</summary>");
+            history = true;
+            out.push_str(tag);
         } else {
             out.push_str(tag);
         }
         cursor = end;
+    }
+    if history {
+        out.push_str("</details>");
     }
     out
 }
@@ -1883,6 +1917,56 @@ mod tests {
     #[test]
     fn only_the_outer_blockquote_is_collapsed() {
         let html = "<blockquote>outer<blockquote>inner</blockquote></blockquote>";
+        let out = collapse_quotes(html);
+        assert_eq!(out.matches("<details").count(), 1);
+        assert_eq!(out.matches("</details>").count(), 1);
+    }
+
+    #[test]
+    fn collapses_outlook_quoted_history() {
+        let html = "<p>new reply</p>\
+            <div id=\"mail-editor-reference-message-container\">\
+            <div id=\"mail-editor-reference-message-body\">\
+            <div class=\"ms-outlook-mobile-reference-message\">old text</div>\
+            </div></div>";
+        let out = collapse_quotes(html);
+        assert!(out.contains("<p>new reply</p>"));
+        let folded = out.find("<details class=\"quote\">").expect("quote folded");
+        let new = out.find("<p>new reply</p>").unwrap();
+        assert!(new < folded, "new content stays outside the fold");
+        assert!(out.contains("old text"));
+        assert_eq!(out.matches("<details").count(), 1);
+        assert_eq!(out.matches("</details>").count(), 1);
+    }
+
+    #[test]
+    fn collapses_gmail_quoted_history() {
+        let html = "<p>new</p><div class=\"gmail_quote\">\
+            <div class=\"gmail_attr\">On Nov 3, Ed wrote:</div>\
+            <blockquote>old</blockquote></div>";
+        let out = collapse_quotes(html);
+        assert_eq!(out.matches("<details").count(), 1);
+        assert_eq!(out.matches("</details>").count(), 1);
+        assert!(out.contains("On Nov 3, Ed wrote:"));
+        assert!(out.contains("old"));
+    }
+
+    #[test]
+    fn collapses_outlook_desktop_quoted_history() {
+        let html = "<p>new</p><div id=\"appendonsend\"></div><hr>\
+            <div id=\"divRplyFwdMsg\">From: A</div><p>old</p>";
+        let out = collapse_quotes(html);
+        assert_eq!(out.matches("<details").count(), 1);
+        assert_eq!(out.matches("</details>").count(), 1);
+        assert!(out.contains("From: A"));
+        assert!(out.contains("old"));
+    }
+
+    #[test]
+    fn does_not_double_fold_a_blockquote_inside_a_wrapper() {
+        let html = "<p>new</p>\
+            <div id=\"mail-editor-reference-message-container\">\
+            <blockquote>old</blockquote></div>";
         let out = collapse_quotes(html);
         assert_eq!(out.matches("<details").count(), 1);
         assert_eq!(out.matches("</details>").count(), 1);
