@@ -663,12 +663,31 @@ fn render_preview(ui: &Ui, pane: &ReadingPane, row: &MessageRow) {
         .load_html(&conversation_html(&theme, &data, readable), None);
 }
 
+/// A one-line preview for a collapsed message header: the first non-empty line,
+/// capped so a long paragraph does not push the date off screen.
+fn header_snippet(text: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let mut chars = line.chars();
+    let mut snippet: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        snippet.push('…');
+    }
+    snippet
+}
+
 /// The bits of one message the reading pane needs to render.
 struct RenderedMessage {
     id: i64,
     has_body: bool,
     sender: String,
     date: String,
+    /// Capped first line, shown in the collapsed header.
+    snippet: String,
     text: String,
     html: Option<String>,
     /// Display name of the message this one replies to, when known.
@@ -687,6 +706,7 @@ fn thread_render_data(db: &Db, row: &MessageRow) -> Vec<RenderedMessage> {
             has_body: false,
             sender: row.sender.clone(),
             date: row.date_label.clone(),
+            snippet: header_snippet(&row.snippet),
             text: row.snippet.clone(),
             html: None,
             reply_to: None,
@@ -717,6 +737,7 @@ fn thread_render_data(db: &Db, row: &MessageRow) -> Vec<RenderedMessage> {
                 has_body,
                 sender: message.from.display().to_string(),
                 date: format_timestamp(message.date.unix_timestamp()),
+                snippet: header_snippet(&text),
                 text,
                 html,
                 reply_to,
@@ -1692,8 +1713,14 @@ table[border]:not([border="0"]) td { border: 1px solid rgba(127,127,127,0.4); pa
 .thread { padding: 8px 12px 12px; }
 .msg { padding: 12px 0; border-bottom: 1px solid rgba(127,127,127,0.25); }
 .msg:last-child { border-bottom: 0; padding-bottom: 4px; }
-.head { display: flex; align-items: baseline; gap: 8px; }
+.head { display: flex; align-items: baseline; gap: 8px; cursor: pointer; list-style: none; }
+.head::-webkit-details-marker { display: none; }
+.head::marker { content: ""; }
+.msg > .head::before { content: "▸"; opacity: 0.55; font-size: 0.8em; }
+.msg[open] > .head::before { content: "▾"; }
 .who { font-weight: 700; }
+.snippet { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.7; font-size: 0.9em; }
+.msg[open] > .head .snippet { display: none; }
 .when { margin-left: auto; font-size: 0.85em; opacity: 0.7; white-space: nowrap; }
 .reply { font-size: 0.85em; opacity: 0.7; margin-top: 2px; }
 .body { margin-top: 6px; }
@@ -1760,13 +1787,22 @@ fn themed_html(html: &str, theme: &HtmlTheme) -> String {
 /// sanitised; the surrounding conversation markup is ours.
 fn conversation_html(theme: &HtmlTheme, messages: &[RenderedMessage], readable: bool) -> String {
     let mut body = String::from("<div id=\"jmail-thread\" class=\"thread\">");
-    for message in messages {
-        body.push_str("<section class=\"msg\">");
-        body.push_str("<div class=\"head\"><span class=\"who\">");
+    // Newest message open, every older one folded behind its clickable header.
+    let newest = messages.len().saturating_sub(1);
+    for (index, message) in messages.iter().enumerate() {
+        let open = if index == newest { " open" } else { "" };
+        body.push_str(&format!("<details class=\"msg\"{open}>"));
+        body.push_str("<summary class=\"head\"><span class=\"who\">");
         body.push_str(&escape_html(&message.sender));
-        body.push_str("</span><span class=\"when\">");
+        body.push_str("</span>");
+        if !message.snippet.is_empty() {
+            body.push_str("<span class=\"snippet\">");
+            body.push_str(&escape_html(&message.snippet));
+            body.push_str("</span>");
+        }
+        body.push_str("<span class=\"when\">");
         body.push_str(&escape_html(&message.date));
-        body.push_str("</span></div>");
+        body.push_str("</span></summary>");
         if let Some(reply_to) = &message.reply_to {
             body.push_str("<div class=\"reply\">↳ in reply to ");
             body.push_str(&escape_html(reply_to));
@@ -1780,7 +1816,7 @@ fn conversation_html(theme: &HtmlTheme, messages: &[RenderedMessage], readable: 
         body.push_str(&sanitize_html(&rendered, readable));
         body.push_str("</div>");
         body.push_str(&attachments_html(message.id, &message.attachments));
-        body.push_str("</section>");
+        body.push_str("</details>");
     }
     body.push_str("</div>");
     format!("<!DOCTYPE html>{}{body}", theme_style(theme, readable))
@@ -2017,6 +2053,7 @@ mod tests {
             has_body: true,
             sender: sender.to_string(),
             date: "Mon, 1 Jan".to_string(),
+            snippet: header_snippet(text),
             text: text.to_string(),
             html: None,
             reply_to: None,
@@ -2035,6 +2072,55 @@ mod tests {
         assert!(out.contains("first body"));
         assert!(out.contains("second body"));
         assert!(out.starts_with("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn conversation_messages_are_collapsible_details() {
+        let first = rendered(1, "Alice", "first body");
+        let second = rendered(2, "Bob", "second body");
+        let out = conversation_html(&test_theme(), &[first, second], true);
+        assert!(out.contains("<details class=\"msg\">"));
+        assert!(out.contains("<details class=\"msg\" open>"));
+        assert!(out.contains("<summary class=\"head\">"));
+        // The older message is closed; the newest one is open.
+        assert!(
+            out.find("<details class=\"msg\">").unwrap()
+                < out.find("<details class=\"msg\" open>").unwrap()
+        );
+        // The body sits after the header, so collapsing hides it.
+        let first_summary_end = out.find("</summary>").unwrap();
+        assert!(out[first_summary_end..].contains("first body"));
+    }
+
+    #[test]
+    fn conversation_single_message_is_open() {
+        let out = conversation_html(&test_theme(), &[rendered(1, "Alice", "only")], true);
+        assert!(out.contains("<details class=\"msg\" open>"));
+        assert!(!out.contains("<details class=\"msg\">"));
+    }
+
+    #[test]
+    fn collapsed_headers_show_a_capped_first_line() {
+        let long = "word ".repeat(80);
+        let out = conversation_html(&test_theme(), &[rendered(1, "Alice", &long)], true);
+        let summary = &out[out.find("<summary class=\"head\">").unwrap()
+            ..out.find("</summary>").unwrap()];
+        assert!(summary.contains("<span class=\"snippet\">"));
+        assert!(summary.contains('…'));
+        assert!(summary.len() < long.len());
+    }
+
+    #[test]
+    fn collapsed_header_uses_only_the_first_line() {
+        let out = conversation_html(
+            &test_theme(),
+            &[rendered(1, "Alice", "first line\nsecond line")],
+            true,
+        );
+        let summary = &out[out.find("<summary class=\"head\">").unwrap()
+            ..out.find("</summary>").unwrap()];
+        assert!(summary.contains("first line"));
+        assert!(!summary.contains("second line"));
     }
 
     #[test]
