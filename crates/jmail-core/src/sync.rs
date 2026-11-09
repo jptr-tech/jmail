@@ -44,6 +44,10 @@ const FLAG_REFRESH_CHUNK: usize = 200;
 /// often (on each poll/IDLE wake); this slower pass catches archives and other
 /// folders the user is not currently looking at.
 const FLAG_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
+/// How long to wait for the server to acknowledge `IDLE`/`DONE` before treating
+/// the connection as dead and reconnecting. Without this, a silently dropped
+/// connection (e.g. after suspend/resume) can block `DONE` forever.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where a conversation should be moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,7 +360,10 @@ async fn run_session(
         let Some(current) = session.take() else { return Ok(()) };
         let unsolicited = current.unsolicited_receiver();
         let mut handle = current.into_idle();
-        handle.init().await.map_err(protocol)?;
+        tokio::time::timeout(IDLE_TIMEOUT, handle.init())
+            .await
+            .map_err(|_| Error::Network("timed out starting IMAP IDLE".into()))?
+            .map_err(protocol)?;
         let deadline = tokio::time::Instant::now() + poll_interval;
         let mut prefetch_now = false;
         let mut outbox_now = false;
@@ -413,7 +420,10 @@ async fn run_session(
                 }
             }
         };
-        let raw = handle.done().await.map_err(protocol)?;
+        let raw = tokio::time::timeout(IDLE_TIMEOUT, handle.done())
+            .await
+            .map_err(|_| Error::Network("timed out leaving IMAP IDLE".into()))?
+            .map_err(protocol)?;
         let mut conn = ImapSession::from_session(raw, settings.clone(), supports_move);
 
         // Confirm or roll back queued operations before anything slower.
